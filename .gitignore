@@ -1,0 +1,25 @@
+# 构建产物
+build/
+app/build/
+.gradle/
+*.iml
+.idea/
+captures/
+
+# 本机配置（含绝对路径与密钥，绝对不要提交）
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# 原生依赖（体积大，需按 README 自行 clone）
+app/src/main/cpp/llama.cpp/
+
+# 其它
+*.log
+*.hprof
+.DS_Store
+
+# NDK/CMake 构建缓存
+.cxx/
+app/.cxx/
