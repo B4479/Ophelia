@@ -267,9 +267,24 @@ App → 设置 → 音色 → 导入声音包 → 选 zip。单包约 **320–45
 
 ---
 
+## 🙏 引用与致谢
+
+本项目建立在这些开源工作之上（完整清单与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)）：
+
+| 项目 | 用途 |
+|---|---|
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | 本地对话 / 识图推理（含 `tools/mtmd`） |
+| [Genie-TTS](https://github.com/High-Logic/Genie-TTS) | GPT-SoVITS → ONNX 转换与参考特征流程 |
+| [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) | 语音模型结构与推理语义 |
+| [atri-vc](https://github.com/spider996/atri-vc) | 中文 G2P 文本前端参考 |
+| [FlagEmbedding / bge-small-zh](https://github.com/FlagOpen/FlagEmbedding) | 知识库向量模型 |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) · [PdfBox-Android](https://github.com/TomRoush/PdfBox-Android) · [ML Kit](https://developers.google.com/ml-kit) | 端侧推理、PDF 解析、OCR |
+
+> 仓库**不含**任何模型权重、音色包、角色素材、API Key 或签名文件；相关版权归各自权利方。
+
 ## 📄 License
 
-代码部分建议采用 MIT（请按你的意愿替换）。**第三方资源**遵循各自许可：
+代码采用 MIT（见 [LICENSE](LICENSE)）。第三方组件与许可详见 [THIRD_PARTY.md](THIRD_PARTY.md)，模型与素材遵循各自许可：
 
 - Qwen / GLM / DeepSeek / Gemma 模型：见对应仓库许可
 - llama.cpp：MIT
