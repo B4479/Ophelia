@@ -16,6 +16,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Person
@@ -159,6 +160,20 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
             )
 
             Spacer(Modifier.height(10.dp))
+            val ctx = LocalContext.current
+            ModuleRow(
+                icon = Icons.Filled.Forum,
+                title = "交流反馈",
+                subtitle = "QQ：3685683097（点击复制）",
+                onClick = {
+                    val cb = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    cb.setPrimaryClip(android.content.ClipData.newPlainText("QQ", FEEDBACK_QQ))
+                    android.widget.Toast.makeText(ctx, "已复制 QQ 号：$FEEDBACK_QQ", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            )
+
+            Spacer(Modifier.height(10.dp))
             ModuleRow(
                 icon = Icons.Filled.BugReport,
                 title = "调试日志",
@@ -173,6 +188,8 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
         }
     }
 }
+
+const val FEEDBACK_QQ = "3685683097"
 
 @Composable
 private fun ModuleRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {

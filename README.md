@@ -267,6 +267,12 @@ App → 设置 → 音色 → 导入声音包 → 选 zip。单包约 **320–45
 
 ---
 
+## 💬 交流反馈
+
+- **QQ：3685683097**（问题反馈 / 使用交流）
+- 也可以在 GitHub [Issues](https://github.com/B4479/Ophelia/issues) 提问题、提需求
+- 反馈时建议附上：机型、Android 版本、复现步骤；日志可在 App「设置 → 调试日志」查看
+
 ## 🙏 引用与致谢
 
 本项目建立在这些开源工作之上（完整清单与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)）：
