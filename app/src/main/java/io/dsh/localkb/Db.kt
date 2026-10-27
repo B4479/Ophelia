@@ -34,6 +34,27 @@ data class ChatRow(
     val bgPath: String? = null,
     val bgBlur: Int = 8,
     val bgDim: Int = 60,
+    val lorebookId: Long? = null,
+)
+
+data class Lorebook(
+    val id: Long,
+    val name: String,
+    val createdAt: Long,
+    val updatedAt: Long,
+)
+
+data class LoreEntry(
+    val id: Long,
+    val bookId: Long,
+    val title: String,
+    val content: String,
+    val enabled: Boolean,
+    val sort: Int,
+    val createdAt: Long,
+    val mode: String = MODE_ALWAYS,   // always / keyword / vector
+    val keys: String? = null,
+    val emb: FloatArray? = null,
 )
 
 data class MessageRow(
@@ -128,12 +149,39 @@ private fun bytesToFloats(b: ByteArray): FloatArray {
     return out
 }
 
-class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
+const val MODE_ALWAYS = "always"
+const val MODE_KEYWORD = "keyword"
+const val MODE_VECTOR = "vector"
+
+class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
+
+    /** 首次安装引导：已有任一配置（云端 API / 本地对话模型）就直接标记完成。 */
+    fun ensureOnboardingState(hasModel: Boolean) {
+        if (getSetting("onboarding_done") != null) return
+        setSetting("onboarding_done", if (hasModel) "1" else "0")
+    }
+
+    /** 世界书三模式列的自愈式补列（防止版本号已升但列没加上）。 */
+    fun ensureLoreColumns() {
+        val cols = HashSet<String>()
+        runCatching {
+            readableDatabase.rawQuery("PRAGMA table_info(lore_entry)", null).use { c ->
+                while (c.moveToNext()) cols.add(c.getString(1))
+            }
+        }
+        runCatching {
+            if ("mode" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN mode TEXT NOT NULL DEFAULT 'always'")
+            if ("keys" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN keys TEXT")
+            if ("emb" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN emb BLOB")
+            android.util.Log.i("DbSchema", "lore columns ensured: $cols")
+        }.onFailure { android.util.Log.e("DbSchema", "ensure lore columns failed: $it") }
+    }
 
     /** 启动自检：关键列缺失时记日志并尽力补齐。 */
     fun verifySchema() {
+        ensureLoreColumns()
         val required = mapOf(
-            "chat" to listOf("kbs", "voice_id", "assistant_avatar", "bg_path", "bg_blur", "bg_dim"),
+            "chat" to listOf("kbs", "voice_id", "assistant_avatar", "bg_path", "bg_blur", "bg_dim", "lorebook_id"),
             "message" to listOf("parent_id", "model", "edited", "deleted", "citations", "attachments"),
             "kb" to listOf("note", "top_k")
         )
@@ -161,8 +209,18 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
         db.execSQL("CREATE TABLE cloud_model(id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, model TEXT NOT NULL, notes TEXT, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE TABLE model_source(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, builtin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX idx_chunk_kb ON chunk(kb_id)")
+        createLoreTables(db)
+        runCatching { db.execSQL("ALTER TABLE lore_entry ADD COLUMN mode TEXT NOT NULL DEFAULT 'always'") }
+        runCatching { db.execSQL("ALTER TABLE lore_entry ADD COLUMN keys TEXT") }
+        runCatching { db.execSQL("ALTER TABLE lore_entry ADD COLUMN emb BLOB") }
         createCharacterTable(db)
         createChatTables(db)
+    }
+
+    private fun createLoreTables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS lorebook(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS lore_entry(id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_lore_book ON lore_entry(book_id)")
     }
 
     private fun createChatTables(db: SQLiteDatabase) {
@@ -173,7 +231,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
                 "origin_chat_id INTEGER, branch_from_message_id INTEGER, " +
                 "kbs TEXT, assistant_name TEXT, assistant_note TEXT, assistant_prompt TEXT, voice_id TEXT, " +
                 "assistant_avatar TEXT, bg_path TEXT, bg_blur INTEGER NOT NULL DEFAULT 8, " +
-                "bg_dim INTEGER NOT NULL DEFAULT 60)"
+                "bg_dim INTEGER NOT NULL DEFAULT 60, lorebook_id INTEGER)"
         )
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS message(" +
@@ -201,6 +259,23 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
         if (oldVersion < 2) createCharacterTable(db)
         if (oldVersion < 3) createChatTables(db)
         val migrationErrors = ArrayList<String>()
+        if (oldVersion < 15) {
+            listOf(
+                "CREATE TABLE IF NOT EXISTS lorebook(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS lore_entry(id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_lore_book ON lore_entry(book_id)",
+                "ALTER TABLE chat ADD COLUMN lorebook_id INTEGER"
+            ).forEach { sql -> runCatching { db.execSQL(sql) }.onFailure { migrationErrors.add("$sql :: ${it.message}") } }
+        }
+        if (oldVersion < 15) {
+            listOf(
+                "ALTER TABLE lore_entry ADD COLUMN mode TEXT NOT NULL DEFAULT 'always'",
+                "ALTER TABLE lore_entry ADD COLUMN keys TEXT",
+                "ALTER TABLE lore_entry ADD COLUMN emb BLOB"
+            ).forEach { sql ->
+                runCatching { db.execSQL(sql) }.onFailure { android.util.Log.e("DbMigration", "lore: $it") }
+            }
+        }
         if (oldVersion < 14) {
             listOf(
                 "ALTER TABLE chat ADD COLUMN bg_path TEXT",
@@ -339,6 +414,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
         assistantPrompt: String? = null,
         voiceId: String? = null,
         assistantAvatar: String? = null,
+        lorebookId: Long? = null,
     ): Long {
         val now = System.currentTimeMillis()
         val cv = ContentValues().apply {
@@ -354,6 +430,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
             put("assistant_prompt", assistantPrompt)
             put("voice_id", voiceId)
             put("assistant_avatar", assistantAvatar)
+            put("lorebook_id", lorebookId)
         }
         return writableDatabase.insert("chat", null, cv)
     }
@@ -387,11 +464,130 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
         writableDatabase.update("chat", cv, "id=?", arrayOf(id.toString()))
     }
 
+    // ---------- 世界书 ----------
+    fun listLorebooks(): List<Lorebook> {
+        val out = ArrayList<Lorebook>()
+        readableDatabase.rawQuery("SELECT id,name,created_at,updated_at FROM lorebook ORDER BY id DESC", null).use { c ->
+            while (c.moveToNext()) out.add(Lorebook(c.getLong(0), c.getString(1), c.getLong(2), c.getLong(3)))
+        }
+        return out
+    }
+
+    fun lorebookById(id: Long): Lorebook? =
+        listLorebooks().firstOrNull { it.id == id }
+
+    fun createLorebook(name: String): Long {
+        val now = System.currentTimeMillis()
+        val cv = ContentValues().apply {
+            put("name", name); put("created_at", now); put("updated_at", now)
+        }
+        return writableDatabase.insert("lorebook", null, cv)
+    }
+
+    fun renameLorebook(id: Long, name: String) {
+        val cv = ContentValues().apply { put("name", name); put("updated_at", System.currentTimeMillis()) }
+        writableDatabase.update("lorebook", cv, "id=?", arrayOf(id.toString()))
+    }
+
+    fun touchLorebook(id: Long) {
+        val cv = ContentValues().apply { put("updated_at", System.currentTimeMillis()) }
+        writableDatabase.update("lorebook", cv, "id=?", arrayOf(id.toString()))
+    }
+
+    fun countChatsUsingLorebook(id: Long): Int {
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM chat WHERE lorebook_id=?", arrayOf(id.toString())).use { c ->
+            return if (c.moveToNext()) c.getInt(0) else 0
+        }
+    }
+
+    /** 删除集锦：同时解除会话绑定（历史消息不动）。 */
+    fun deleteLorebook(id: Long) {
+        writableDatabase.beginTransaction()
+        try {
+            writableDatabase.delete("lore_entry", "book_id=?", arrayOf(id.toString()))
+            writableDatabase.delete("lorebook", "id=?", arrayOf(id.toString()))
+            val cv = ContentValues().apply { putNull("lorebook_id") }
+            writableDatabase.update("chat", cv, "lorebook_id=?", arrayOf(id.toString()))
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
+    fun listLoreEntries(bookId: Long, onlyEnabled: Boolean = false): List<LoreEntry> {
+        val out = ArrayList<LoreEntry>()
+        val sql = "SELECT id,book_id,title,content,enabled,sort,created_at,mode,keys,emb FROM lore_entry WHERE book_id=?" +
+            (if (onlyEnabled) " AND enabled=1" else "") + " ORDER BY sort ASC, id ASC"
+        readableDatabase.rawQuery(sql, arrayOf(bookId.toString())).use { c ->
+            while (c.moveToNext()) {
+                val embBytes = c.getBlob(9)
+                out.add(
+                    LoreEntry(
+                        c.getLong(0), c.getLong(1), c.getString(2), c.getString(3),
+                        c.getInt(4) == 1, c.getInt(5), c.getLong(6),
+                        mode = c.getString(7) ?: MODE_ALWAYS,
+                        keys = c.getString(8),
+                        emb = embBytes?.let { bytesToFloats(it) }
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    fun addLoreEntry(
+        bookId: Long,
+        title: String,
+        content: String,
+        mode: String = MODE_ALWAYS,
+        keys: String? = null,
+        emb: FloatArray? = null,
+    ): Long {
+        val maxSort = readableDatabase.rawQuery(
+            "SELECT COALESCE(MAX(sort),0) FROM lore_entry WHERE book_id=?", arrayOf(bookId.toString())
+        ).use { c -> if (c.moveToNext()) c.getInt(0) else 0 }
+        val cv = ContentValues().apply {
+            put("book_id", bookId); put("title", title); put("content", content)
+            put("enabled", 1); put("sort", maxSort + 1); put("created_at", System.currentTimeMillis())
+            put("mode", mode); put("keys", keys)
+            if (emb != null) put("emb", floatsToBytes(emb))
+        }
+        val id = writableDatabase.insert("lore_entry", null, cv)
+        touchLorebook(bookId)
+        return id
+    }
+
+    fun updateLoreEntry(
+        id: Long,
+        title: String,
+        content: String,
+        enabled: Boolean,
+        mode: String = MODE_ALWAYS,
+        keys: String? = null,
+        emb: FloatArray? = null,
+    ) {
+        val cv = ContentValues().apply {
+            put("title", title); put("content", content); put("enabled", if (enabled) 1 else 0)
+            put("mode", mode); put("keys", keys)
+            if (emb != null) put("emb", floatsToBytes(emb))
+        }
+        writableDatabase.update("lore_entry", cv, "id=?", arrayOf(id.toString()))
+    }
+
+    fun deleteLoreEntry(id: Long) {
+        writableDatabase.delete("lore_entry", "id=?", arrayOf(id.toString()))
+    }
+
+    fun setChatLorebook(chatId: Long, lorebookId: Long?) {
+        val cv = ContentValues().apply { put("lorebook_id", lorebookId) }
+        writableDatabase.update("chat", cv, "id=?", arrayOf(chatId.toString()))
+    }
+
     fun listChats(mode: String): List<ChatRow> {
         val out = ArrayList<ChatRow>()
         readableDatabase.rawQuery(
             "SELECT id,mode,title,character_id,kb_id,created_at,updated_at,origin_chat_id,branch_from_message_id," +
-                "kbs,assistant_name,assistant_note,assistant_prompt,voice_id,assistant_avatar,bg_path,bg_blur,bg_dim " +
+                "kbs,assistant_name,assistant_note,assistant_prompt,voice_id,assistant_avatar,bg_path,bg_blur,bg_dim,lorebook_id " +
                 "FROM chat WHERE mode=? AND EXISTS(SELECT 1 FROM message m WHERE m.chat_id=chat.id) " +
                 "ORDER BY updated_at DESC", arrayOf(mode)
         ).use { c ->
@@ -405,7 +601,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
                         if (c.isNull(7)) null else c.getLong(7),
                         if (c.isNull(8)) null else c.getLong(8),
                         c.getString(9), c.getString(10), c.getString(11), c.getString(12), c.getString(13), c.getString(14),
-                    c.getString(15), c.getInt(16), c.getInt(17)
+                    c.getString(15), c.getInt(16), c.getInt(17),
+                    if (c.isNull(18)) null else c.getLong(18)
                     )
                 )
             }
@@ -416,7 +613,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
     fun chatById(id: Long): ChatRow? {
         readableDatabase.rawQuery(
             "SELECT id,mode,title,character_id,kb_id,created_at,updated_at,origin_chat_id,branch_from_message_id," +
-                "kbs,assistant_name,assistant_note,assistant_prompt,voice_id,assistant_avatar,bg_path,bg_blur,bg_dim " +
+                "kbs,assistant_name,assistant_note,assistant_prompt,voice_id,assistant_avatar,bg_path,bg_blur,bg_dim,lorebook_id " +
                 "FROM chat WHERE id=?", arrayOf(id.toString())
         ).use { c ->
             if (c.moveToNext()) {
@@ -428,7 +625,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 14) {
                     if (c.isNull(7)) null else c.getLong(7),
                     if (c.isNull(8)) null else c.getLong(8),
                     c.getString(9), c.getString(10), c.getString(11), c.getString(12), c.getString(13), c.getString(14),
-                    c.getString(15), c.getInt(16), c.getInt(17)
+                    c.getString(15), c.getInt(16), c.getInt(17),
+                    if (c.isNull(18)) null else c.getLong(18)
                 )
             }
         }

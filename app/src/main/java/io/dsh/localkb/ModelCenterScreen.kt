@@ -67,6 +67,11 @@ fun ModelCenterScreen(db: Db, onBack: () -> Unit) {
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) { runCatching { CloudPresets.seedIfNeeded(db) } }
         reloadCloud()
+        // 首页引导：配置云端 → 直接打开添加弹窗；下载本地 → 停在“其它模型”
+        when (db.getSetting("guide_target")) {
+            "cloud" -> { db.setSetting("guide_target", ""); showAddCloud = true }
+            "local" -> { db.setSetting("guide_target", ""); tabIndex = 0 }
+        }
     }
 
     fun currentSel(): String = when (type) {

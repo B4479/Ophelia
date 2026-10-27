@@ -48,8 +48,8 @@ private val SMuted: Color get() = AppColors.muted
 /** 设置中心：模块化入口，后续模块直接往里加。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
-    var page by remember { mutableStateOf("root") }
+fun SettingsScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit, initialPage: String = "root") {
+    var page by remember { mutableStateOf(initialPage) }
 
     when (page) {
         "voice" -> VoiceSettingsScreen(db, tts) { page = "root" }
@@ -82,6 +82,7 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
         if (m.isBlank()) "未配置" else m
     }
     val charCount = remember { runCatching { db.listCharacters().size }.getOrDefault(0) }
+    val loreCount = remember { runCatching { db.listLorebooks().size }.getOrDefault(0) }
 
     Scaffold(
         containerColor = SBg,
@@ -106,30 +107,6 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
                 onClick = { onOpen("profile") }
             )
             Spacer(Modifier.height(10.dp))
-            var readActions by remember { mutableStateOf(db.getSetting("tts_read_actions") == "1") }
-            Row(
-                Modifier.fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(AppColors.card)
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("朗读动作描写", color = AppColors.text, fontSize = 14.sp)
-                    Text(
-                        if (readActions) "括号和 *…* 里的内容也会读出来" else "跳过（）、()、【】和 *…* 里的动作描写",
-                        color = AppColors.muted, fontSize = 11.sp
-                    )
-                }
-                Switch(
-                    checked = readActions,
-                    onCheckedChange = { v ->
-                        readActions = v
-                        db.setSetting("tts_read_actions", if (v) "1" else "0")
-                    }
-                )
-            }
-            Spacer(Modifier.height(10.dp))
             ModuleRow(
                 icon = Icons.Filled.RecordVoiceOver,
                 title = "音色",
@@ -153,8 +130,8 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
             Spacer(Modifier.height(10.dp))
             ModuleRow(
                 icon = Icons.Filled.Person,
-                title = "角色卡",
-                subtitle = "已导入 $charCount 张",
+                title = "角色卡/世界书",
+                subtitle = "$charCount 张角色卡 · $loreCount 个集锦",
                 onClick = { onOpen("characters") }
             )
 
@@ -240,6 +217,31 @@ private fun VoiceSettingsScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize().padding(horizontal = 16.dp)) {
+            // 朗读动作描写（置顶）
+            var readActions by remember { mutableStateOf(db.getSetting("tts_read_actions") == "1") }
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AppColors.card)
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("朗读动作描写", color = AppColors.text, fontSize = 14.sp)
+                    Text(
+                        if (readActions) "括号和 *…* 里的内容也会读出来" else "跳过（）、()、【】和 *…* 里的动作描写",
+                        color = AppColors.muted, fontSize = 11.sp
+                    )
+                }
+                Switch(
+                    checked = readActions,
+                    onCheckedChange = { v ->
+                        readActions = v
+                        db.setSetting("tts_read_actions", if (v) "1" else "0")
+                    }
+                )
+            }
+            Spacer(Modifier.height(10.dp))
             if (voices.isEmpty()) {
                 Text(
                     "还没有声音包。\n点右上角「导入声音包」选一个 *_voice.zip（约 320MB）。",

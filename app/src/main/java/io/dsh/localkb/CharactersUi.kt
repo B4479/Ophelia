@@ -113,6 +113,10 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
     var pending by remember { mutableStateOf<PendingImport?>(null) }
     var showAddMenu by remember { mutableStateOf(false) }
     var msg by remember { mutableStateOf<String?>(null) }
+    var tab by remember { mutableStateOf(0) }              // 0=角色卡 1=世界书
+    var showNewLorebook by remember { mutableStateOf(false) }
+    var loreRefresh by remember { mutableStateOf(0) }
+    var detailBook by remember { mutableStateOf<Lorebook?>(null) }
 
     suspend fun reload() {
         rows = withContext(Dispatchers.IO) { db.listCharacters() }
@@ -138,7 +142,7 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
         containerColor = CBg,
         topBar = {
             TopAppBar(
-                title = { Text("角色卡", fontWeight = FontWeight.SemiBold) },
+                title = { Text("角色卡/世界书", fontWeight = FontWeight.SemiBold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = AppColors.text) }
                 },
@@ -146,12 +150,33 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showAddMenu = true }, containerColor = CAccent) {
-                Icon(Icons.Filled.Add, "添加角色卡", tint = AppColors.onAccent)
+            FloatingActionButton(
+                onClick = { if (tab == 0) showAddMenu = true else showNewLorebook = true },
+                containerColor = CAccent
+            ) {
+                Icon(Icons.Filled.Add, if (tab == 0) "添加角色卡" else "新建集锦", tint = AppColors.onAccent)
             }
         }
     ) { pad ->
-        Column(Modifier.padding(pad).fillMaxSize().padding(horizontal = 14.dp)) {
+        Column(Modifier.padding(pad).fillMaxSize()) {
+            TabRow(selectedTabIndex = tab, containerColor = CBg, contentColor = CAccent) {
+                Tab(selected = tab == 0, onClick = { tab = 0 }) {
+                    Text("角色卡", fontSize = 14.sp, modifier = Modifier.padding(vertical = 12.dp))
+                }
+                Tab(selected = tab == 1, onClick = { tab = 1 }) {
+                    Text("世界书", fontSize = 14.sp, modifier = Modifier.padding(vertical = 12.dp))
+                }
+            }
+            Column(Modifier.fillMaxSize().padding(horizontal = 14.dp).padding(top = 10.dp)) {
+            if (tab == 1) {
+                LorebookListInline(
+                    db = db,
+                    refreshKey = loreRefresh,
+                    onOpen = { detailBook = it },
+                    onCreate = { showNewLorebook = true }
+                )
+            } else {
+
             msg?.let {
                 Text(it, color = CAccent, fontSize = 12.sp)
                 Spacer(Modifier.height(6.dp))
@@ -187,6 +212,28 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
                     }
                 }
             }
+            }
+            }
+        }
+    }
+
+    if (showNewLorebook) {
+        NewLorebookDialog(
+            onDismiss = { showNewLorebook = false },
+            onCreate = { name ->
+                scope.launch {
+                    withContext(Dispatchers.IO) { db.createLorebook(name) }
+                    showNewLorebook = false
+                    loreRefresh++
+                }
+            }
+        )
+    }
+
+    detailBook?.let { book ->
+        LorebookDetailScreen(db, book) {
+            detailBook = null
+            loreRefresh++
         }
     }
 

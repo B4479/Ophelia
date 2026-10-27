@@ -74,6 +74,13 @@ private fun AppRoot(db: Db) {
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             runCatching { db.verifySchema() }
+            runCatching {
+                val hasApi = !db.getSetting("llm_key").isNullOrBlank() || db.listCloudModels().isNotEmpty()
+                val hasLocal = Catalog.MODELS.any {
+                    it.type == Catalog.TYPE_CHAT && Catalog.isInstalled(context, it)
+                }
+                db.ensureOnboardingState(hasApi || hasLocal)
+            }
             runCatching { ImportQueue.resumeAll(context, db) }
         }
     }
@@ -114,14 +121,15 @@ private fun AppRoot(db: Db) {
     var currentKb by remember { mutableStateOf<Kb?>(null) }
     var showChat by remember { mutableStateOf(true) }
     var showSettings by remember { mutableStateOf(false) }
+    var settingsPage by remember { mutableStateOf("root") }
     var viewer by remember { mutableStateOf<Pair<Long, Int>?>(null) }
     val kb = currentKb
     when {
         viewer != null -> PdfViewerScreen(db, viewer!!.first, viewer!!.second) { viewer = null }
-        showSettings -> SettingsScreen(db, tts) { showSettings = false }
+        showSettings -> SettingsScreen(db, tts, onBack = { showSettings = false; settingsPage = "root" }, initialPage = settingsPage)
         showChat -> ChatScreen(
             db, tts, amb,
-            onOpenSettings = { showSettings = true },
+            onOpenSettings = { page -> settingsPage = page; showSettings = true },
             onOpenCitation = { docId, page -> viewer = docId to page }
         ) { showChat = false }
         kb == null -> HomeScreen(db, tts, onOpenChat = { showChat = true }) { currentKb = it }

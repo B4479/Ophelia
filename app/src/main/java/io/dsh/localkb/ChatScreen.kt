@@ -9,6 +9,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -23,6 +25,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
@@ -102,7 +106,7 @@ fun ChatScreen(
     db: Db,
     tts: TtsPlayer,
     amb: AmbienceEngine,
-    onOpenSettings: () -> Unit,
+    onOpenSettings: (String) -> Unit,
     onOpenCitation: (docId: Long, page: Int) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -112,6 +116,7 @@ fun ChatScreen(
     var bgBlur by remember { mutableStateOf(8f) }
     var bgDim by remember { mutableStateOf(60f) }
     var showBgDialog by remember { mutableStateOf(false) }
+    var showLorePicker by remember { mutableStateOf(false) }
     var assistantAvatarPath by remember { mutableStateOf<String?>(null) }
     var pendingImage by remember { mutableStateOf<String?>(null) }
     var pendingImageDesc by remember { mutableStateOf<String?>(null) }
@@ -220,6 +225,11 @@ fun ChatScreen(
     var renameTarget by remember { mutableStateOf<ChatRow?>(null) }
     var renameText by remember { mutableStateOf("") }
     var showNewChatMenu by remember { mutableStateOf(false) }
+    var newChatLorebookId by remember { mutableStateOf<Long?>(null) }
+    var newChatLoreName by remember { mutableStateOf<String?>(null) }
+    var showNewChatLorePicker by remember { mutableStateOf(false) }
+    var showOnboarding by remember { mutableStateOf(db.getSetting("onboarding_done") == "0") }
+    var currentLoreName by remember { mutableStateOf<String?>(null) }
     var showCharPicker by remember { mutableStateOf(false) }
     var showNewWorkMenu by remember { mutableStateOf(false) }
     var showNewKbPicker by remember { mutableStateOf(false) }
@@ -280,6 +290,9 @@ fun ChatScreen(
         current = row
         withContext(Dispatchers.IO) { db.setSetting("last_chat_id", row.id.toString()) }
         messages = withContext(Dispatchers.IO) { db.messages(row.id) }
+        currentLoreName = withContext(Dispatchers.IO) {
+            row.lorebookId?.let { id -> runCatching { db.lorebookById(id)?.name }.getOrNull() }
+        }
         chatBg = row.bgPath?.takeIf { it.isNotBlank() }
         bgBlur = row.bgBlur.toFloat()
         bgDim = row.bgDim.toFloat()
@@ -375,11 +388,14 @@ fun ChatScreen(
     }
 
     fun createChatSession(characterId: Long?, customTitle: String = "") {
+        val loreId = newChatLorebookId
         scope.launch {
             val title = customTitle.ifBlank { nowTitle("新对话") }
             val id = withContext(Dispatchers.IO) {
-                db.createChat(MODE_CHAT, title, characterId, null)
+                db.createChat(MODE_CHAT, title, characterId, null, lorebookId = loreId)
             }
+            newChatLorebookId = null
+            newChatLoreName = null
             val row = withContext(Dispatchers.IO) { db.chatById(id) } ?: return@launch
             reloadLists()
             openChat(row)
@@ -463,7 +479,14 @@ fun ChatScreen(
         val personaCore = card?.let { CardParser.systemPromptFor(it) }
             ?: "你是一个中文助手。默认用简体中文回答；回答简洁自然，不要重复用户的问题，也不要输出任何标记或特殊符号。"
         val personaBase = if (assistantBlock != null) "$assistantBlock\n\n$personaCore" else personaCore
-        val persona = ProfileStore.augment(db, personaBase)
+        // 世界书：绑定了集锦就拼进系统提示词（上限 2000 字，见 lorebookBlock）
+        val loreBlock = if (chat.mode == MODE_CHAT) {
+            withContext(Dispatchers.IO) {
+                runCatching { lorebookBlock(context, db, chat.id, chat.lorebookId, userText) }.getOrNull()
+            }
+        } else null
+        val withLore = if (loreBlock.isNullOrBlank()) personaBase else "$personaBase\n\n$loreBlock"
+        val persona = ProfileStore.augment(db, withLore)
 
         if (chat.mode == MODE_WORK) {
             val kbIds = kbIdsOf(chat)
@@ -881,7 +904,8 @@ fun ChatScreen(
                                 when {
                                     current?.originChatId != null -> "分支 · 来自会话 #${current?.originChatId}"
                                     current?.mode == MODE_WORK -> "工作任务"
-                                    current?.mode == MODE_CHAT -> "聊天"
+                                    current?.mode == MODE_CHAT ->
+                                        currentLoreName?.let { "聊天 · 世界书：$it" } ?: "聊天"
                                     else -> "从左侧菜单开始"
                                 },
                                 fontSize = 11.sp, color = ChMuted
@@ -916,6 +940,12 @@ fun ChatScreen(
                                         onClick = { menuOpen = false; showChatKbPicker = true }
                                     )
                                 }
+                                if (current?.mode == MODE_CHAT) {
+                                    DropdownMenuItem(
+                                        text = { Text("世界书") },
+                                        onClick = { menuOpen = false; showLorePicker = true }
+                                    )
+                                }
                                 DropdownMenuItem(
                                     text = { Text("聊天背景") },
                                     onClick = { menuOpen = false; showBgDialog = true }
@@ -926,7 +956,7 @@ fun ChatScreen(
                                 )
                             }
                         }
-                        IconButton(onClick = onOpenSettings) { Icon(Icons.Filled.Settings, "设置", tint = AppColors.text) }
+                        IconButton(onClick = { onOpenSettings("root") }) { Icon(Icons.Filled.Settings, "设置", tint = AppColors.text) }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = ChBg, titleContentColor = AppColors.text)
                 )
@@ -1268,6 +1298,63 @@ fun ChatScreen(
         }
     }
 
+    // ---------- 首次启动引导 ----------
+    if (showOnboarding) {
+        fun finishGuide(target: String?) {
+            db.setSetting("onboarding_done", "1")
+            if (target != null) db.setSetting("guide_target", target)
+            showOnboarding = false
+            if (target != null) onOpenSettings("model")
+        }
+        AlertDialog(
+            onDismissRequest = { /* 必须选一项或点“直接进入” */ },
+            properties = androidx.compose.ui.window.DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            containerColor = AppColors.card,
+            titleContentColor = AppColors.text,
+            textContentColor = AppColors.text,
+            title = { Text("开始使用 Ophelia", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column {
+                    Text("选一种方式开始，之后可在「设置 → 模型选择」随时切换。", color = AppColors.muted, fontSize = 12.sp)
+                    Spacer(Modifier.height(14.dp))
+                    ListItem(
+                        headlineContent = { Text("配置云端 API") },
+                        supportingContent = {
+                            Text("填写地址与密钥，立刻可用；不需要下载大文件", color = AppColors.muted, fontSize = 11.sp)
+                        },
+                        leadingContent = { Icon(Icons.Filled.Cloud, null, tint = AppColors.accent) },
+                        modifier = Modifier.clickable { finishGuide("cloud") }
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    ListItem(
+                        headlineContent = { Text("下载本地模型") },
+                        supportingContent = {
+                            Text("完全离线，需下载 0.4–1.7 GB；手机配置较好时更推荐", color = AppColors.muted, fontSize = 11.sp)
+                        },
+                        leadingContent = { Icon(Icons.Filled.Download, null, tint = AppColors.accent) },
+                        modifier = Modifier.clickable { finishGuide("local") }
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "直接进入",
+                        color = AppColors.muted,
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { finishGuide(null) }
+                            .padding(vertical = 6.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = {}
+        )
+    }
+
     // ---------- 新对话：选角色卡 ----------
     if (showNewChatMenu) {
         AlertDialog(
@@ -1284,6 +1371,17 @@ fun ChatScreen(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
+                    ListItem(
+                        headlineContent = { Text("世界书（可选）") },
+                        supportingContent = {
+                            Text(
+                                newChatLoreName ?: "未选择",
+                                color = if (newChatLoreName == null) ChMuted else ChAccent,
+                                fontSize = 12.sp
+                            )
+                        },
+                        modifier = Modifier.clickable { showNewChatLorePicker = true }
+                    )
                     ListItem(
                         headlineContent = { Text("无角色卡") },
                         supportingContent = { Text("使用通用助手", color = ChMuted, fontSize = 12.sp) },
@@ -1568,6 +1666,107 @@ fun ChatScreen(
             },
             confirmButton = {},
             dismissButton = { TextButton(onClick = { showVoicePicker = false }) { Text("关闭") } }
+        )
+    }
+
+    // 新建对话时的世界书选择
+    if (showNewChatLorePicker) {
+        var books by remember { mutableStateOf(listOf<Lorebook>()) }
+        LaunchedEffect(Unit) { books = withContext(Dispatchers.IO) { db.listLorebooks() } }
+        AlertDialog(
+            onDismissRequest = { showNewChatLorePicker = false },
+            containerColor = AppColors.card,
+            titleContentColor = AppColors.text,
+            textContentColor = AppColors.text,
+            title = { Text("选择世界书") },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                    if (books.isEmpty()) {
+                        Text("还没有世界书，去「角色卡/世界书」页新建。", color = AppColors.muted, fontSize = 12.sp)
+                    }
+                    ListItem(
+                        headlineContent = { Text("不使用", color = if (newChatLorebookId == null) AppColors.accent else AppColors.text) },
+                        modifier = Modifier.clickable {
+                            newChatLorebookId = null
+                            newChatLoreName = null
+                            showNewChatLorePicker = false
+                        }
+                    )
+                    books.forEach { b ->
+                        ListItem(
+                            headlineContent = {
+                                Text(b.name, color = if (newChatLorebookId == b.id) AppColors.accent else AppColors.text)
+                            },
+                            modifier = Modifier.clickable {
+                                newChatLorebookId = b.id
+                                newChatLoreName = b.name
+                                showNewChatLorePicker = false
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { showNewChatLorePicker = false }) { Text("关闭") } }
+        )
+    }
+
+    // 世界书选择
+    if (showLorePicker) {
+        var books by remember { mutableStateOf(listOf<Lorebook>()) }
+        LaunchedEffect(Unit) { books = withContext(Dispatchers.IO) { db.listLorebooks() } }
+        AlertDialog(
+            onDismissRequest = { showLorePicker = false },
+            containerColor = AppColors.card,
+            titleContentColor = AppColors.text,
+            textContentColor = AppColors.text,
+            title = { Text("世界书") },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                    Text(
+                        "绑定的集锦会拼进系统提示词，只对当前会话生效。",
+                        color = AppColors.muted, fontSize = 11.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    if (books.isEmpty()) {
+                        Text("还没有世界书，去「角色卡/世界书」页新建。", color = AppColors.muted, fontSize = 12.sp)
+                    }
+                    ListItem(
+                        headlineContent = { Text("不使用世界书", color = if (current?.lorebookId == null) AppColors.accent else AppColors.text) },
+                        modifier = Modifier.clickable {
+                            scope.launch {
+                                val row = current
+                                if (row != null) {
+                                    withContext(Dispatchers.IO) { db.setChatLorebook(row.id, null) }
+                                    current = row.copy(lorebookId = null)
+                                    currentLoreName = null
+                                }
+                                showLorePicker = false
+                            }
+                        }
+                    )
+                    books.forEach { b ->
+                        ListItem(
+                            headlineContent = {
+                                Text(b.name, color = if (current?.lorebookId == b.id) AppColors.accent else AppColors.text)
+                            },
+                            modifier = Modifier.clickable {
+                                scope.launch {
+                                    val row = current
+                                    if (row != null) {
+                                        withContext(Dispatchers.IO) { db.setChatLorebook(row.id, b.id) }
+                                        current = row.copy(lorebookId = b.id)
+                                        currentLoreName = b.name
+                                    }
+                                    showLorePicker = false
+                                }
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { showLorePicker = false }) { Text("关闭") } }
         )
     }
 
