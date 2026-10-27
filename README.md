@@ -162,9 +162,67 @@ keyPassword=******
    - 本地：模型中心 → 对话 → 下载 Qwen2.5-1.5B 等（或推入 `files/models/*.gguf`）
    - 云端：模型中心 → 对话 → 添加云端模型（Base URL + Key + 模型别名）
 3. **开始对话**：侧边栏「新对话」或「新工作任务」（后者可引用多个库并设定工作助理）
-4. **音色**：设置 → 音色 → 导入声音包（zip，内含 `meta.properties` + onnx）
+4. **音色**：设置 → 音色 → 导入声音包（zip，内含 `meta.properties` + onnx）；制作方法见下节「制作音色包」
 
 ---
+
+## 🎙 制作音色包（GPT-SoVITS → 可导入 zip）
+
+应用只认 **Genie ONNX** 格式的声音包，`.pth` / `.ckpt` 不能直接导入。转换需要 PC + Python ≥ 3.10 + `pip install genie-tts`。
+
+### 需要准备
+
+| 材料 | 说明 |
+|---|---|
+| SoVITS 权重 `.pth` | GPT-SoVITS 训练产出的 SoVITS 模型 |
+| GPT 权重 `.ckpt` | 同一次训练的 GPT 模型 |
+| 参考音频 | 3–10 秒干净人声（wav） |
+| 参考文本 | 这段音频里说的那句话（原文） |
+
+### 三步转换
+
+```python
+import genie_tts as genie
+
+# 1) PyTorch 权重 → ONNX
+genie.convert_to_onnx(
+    torch_pth_path="model.pth",      # SoVITS
+    torch_ckpt_path="model.ckpt",    # GPT
+    output_dir="onnx_out",
+)
+
+# 2) 设定参考音频，导出参考特征（ref_seq / ref_bert / ssl / ref_audio 或 ge）
+genie.set_reference_audio("voice_name", "ref.wav", "参考文本", language="ja")
+
+# 3) 用工作区脚本生成包结构（含 meta.properties 与 ref/*.f32）
+#    python tools/prepare_character.py <name> <onnx_dir> <ref.wav> "<参考文本>" <lang> <out_dir>
+```
+
+### 包内结构（缺一不可）
+
+```
+<voice>/
+├── meta.properties                      # name / type(v2|v2pp) / ref_text / ssl_len …
+├── t2s_encoder_fp32.onnx        (+.bin)
+├── t2s_first_stage_decoder_fp32.onnx
+├── t2s_stage_decoder_fp32.onnx
+├── vits_fp32.onnx               (+.bin)
+└── ref/
+    ├── ref_seq.i64  ref_bert.f32  ssl.f32
+    └── ref_audio.f32（v2）  或  ge.f32 + ge_adv.f32（v2ProPlus）
+```
+
+### 打包导入
+
+```bash
+# 整个目录压成 zip（zip 内任意层级含 meta.properties 即可）
+zip -r 音色名.zip 音色名/
+```
+
+App → 设置 → 音色 → 导入声音包 → 选 zip。单个包约 **320–450 MB**。
+
+> 需要批量处理多个角色时，可用社区脚本 `batch_make.py`（遍历目录找 `.pth`/`.ckpt` + 参考音频）。
+> 转换脚本涉及本机路径与环境变量，未随本仓库发布。
 
 ## 🔒 隐私与数据
 
