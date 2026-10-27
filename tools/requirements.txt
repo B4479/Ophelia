@@ -1,0 +1,14 @@
+# 声音包制作工具链所需依赖
+# 安装: pip install -r requirements.txt
+#
+# 注意:
+# - genie-tts 首次运行会下载约 391MB 的 GenieData，可用 GENIE_DATA_DIR 指定已有目录
+# - torch 建议装 CPU 版即可（转换不需要 GPU）
+# - soundfile 用于批量脚本自动挑选参考音频
+
+genie-tts
+numpy
+onnx
+onnxruntime
+soundfile
+pypinyin

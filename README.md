@@ -108,6 +108,9 @@ app/src/main/
 ├── java/com/moe/gsvtts/          # GPT-SoVITS 端侧推理引擎
 ├── cpp/                          # llama_bridge / vision_bridge / CMake
 └── assets/                       # bge-small 模型、分词表、TTS 文本资源
+
+tools/                            # 声音包转换工具链（Python）
+docs/VOICE_PACK_FORMAT.md         # 声音包格式规范
 ```
 
 ---
@@ -168,61 +171,72 @@ keyPassword=******
 
 ## 🎙 制作音色包（GPT-SoVITS → 可导入 zip）
 
-应用只认 **Genie ONNX** 格式的声音包，`.pth` / `.ckpt` 不能直接导入。转换需要 PC + Python ≥ 3.10 + `pip install genie-tts`。
+应用只认 **Genie ONNX** 格式的声音包，`.pth` / `.ckpt` 不能直接导入。仓库自带完整转换工具链（`tools/`），完整格式定义见 [docs/VOICE_PACK_FORMAT.md](docs/VOICE_PACK_FORMAT.md)。
 
-### 需要准备
+### 环境
 
-| 材料 | 说明 |
+```bash
+pip install -r tools/requirements.txt     # genie-tts / onnx / onnxruntime / numpy / soundfile / pypinyin
+export GENIE_DATA_DIR=/path/to/GenieData  # 可选，genie 首次运行会下载约 391MB 资源
+```
+
+### 一条命令：权重 → 声音包
+
+```bash
+python tools/make_voice.py   --pth  model.pth  --ckpt model.ckpt   --ref-wav ref.wav --ref-text "参考音频里说的那句话" --ref-lang ja   --name roxy --out models/voices/roxy_fp32
+```
+
+产物是 `models/voices/roxy_fp32/`（fp32，约 700MB），再做 int8 量化：
+
+```bash
+python tools/quantize.py --src models/voices/roxy_fp32 --dst models/voices/roxy
+# 单包降到 320–450MB；--vits 可再压一点，但音质有损
+```
+
+### 批量
+
+```bash
+python tools/batch_make.py "D:/models/乐奈" "D:/models/仁菜" --out models/voices
+python tools/batch_make.py "D:/models" --recursive --out models/voices
+```
+
+目录里需要有 `.pth` + `.ckpt` + 若干 wav（或 `.list`）；脚本自动挑 3–10 秒音频、自动量化。
+
+### 校验与打包
+
+```bash
+python tools/verify_pack.py models/voices/roxy          # 目录
+python tools/verify_pack.py 洛琪希.zip                   # 待导入的 zip
+python tools/pack_zip.py models/voices/roxy --out 洛琪希.zip
+```
+
+`verify_pack.py` 会检查：`meta.properties` 字段完整、4 个核心 ONNX 存在、`ref/*.f32` 字节数与 meta 维度自洽、ONNX 能被 onnxruntime 加载。`pack_zip.py` 额外产出 `*.manifest.json`（逐文件 SHA-256）。
+
+### 工具清单
+
+| 脚本 | 作用 |
 |---|---|
-| SoVITS 权重 `.pth` | GPT-SoVITS 训练产出的 SoVITS 模型 |
-| GPT 权重 `.ckpt` | 同一次训练的 GPT 模型 |
-| 参考音频 | 3–10 秒干净人声（wav） |
-| 参考文本 | 这段音频里说的那句话（原文） |
+| `tools/make_voice.py` | `.pth`+`.ckpt` → ONNX → 声音包（含 fp32 外置权重） |
+| `tools/prepare_character.py` | 参考音频 → `ref/` 特征 + `meta.properties` |
+| `tools/quantize.py` | MatMul+Transpose 融合 + int8 量化 |
+| `tools/batch_make.py` | 批量遍历角色目录 |
+| `tools/verify_pack.py` | 声音包/zip 完整性校验（退出码非 0 即失败） |
+| `tools/pack_zip.py` | 打 zip + 生成 manifest |
+| `tools/make_q8_voice.py` | 兼容旧调用（等价 `quantize.py`） |
 
-### 三步转换
+### 原理
 
-```python
-import genie_tts as genie
+原始推理链需要 HuBERT / speaker encoder / RoBERTa（约 1GB）。这些只与**参考音频**有关，因此在 PC 端一次性算好并固化成 `ref/*.f32`，端侧只保留 4 个推理图 —— 这是让 GPT-SoVITS 能跑在手机上的关键，也是本格式与「直接导出 ONNX」的区别。
 
-# 1) PyTorch 权重 → ONNX
-genie.convert_to_onnx(
-    torch_pth_path="model.pth",      # SoVITS
-    torch_ckpt_path="model.ckpt",    # GPT
-    output_dir="onnx_out",
-)
-
-# 2) 设定参考音频，导出参考特征（ref_seq / ref_bert / ssl / ref_audio 或 ge）
-genie.set_reference_audio("voice_name", "ref.wav", "参考文本", language="ja")
-
-# 3) 用工作区脚本生成包结构（含 meta.properties 与 ref/*.f32）
-#    python tools/prepare_character.py <name> <onnx_dir> <ref.wav> "<参考文本>" <lang> <out_dir>
-```
-
-### 包内结构（缺一不可）
-
-```
-<voice>/
-├── meta.properties                      # name / type(v2|v2pp) / ref_text / ssl_len …
-├── t2s_encoder_fp32.onnx        (+.bin)
-├── t2s_first_stage_decoder_fp32.onnx
-├── t2s_stage_decoder_fp32.onnx
-├── vits_fp32.onnx               (+.bin)
-└── ref/
-    ├── ref_seq.i64  ref_bert.f32  ssl.f32
-    └── ref_audio.f32（v2）  或  ge.f32 + ge_adv.f32（v2ProPlus）
-```
+转换底层使用 [Genie-TTS](https://github.com/High-Logic/Genie-TTS) 的 ONNX 导出；本项目补的是**端侧包格式 + 量化 + 校验 + 分发**。
 
 ### 打包导入
 
 ```bash
-# 整个目录压成 zip（zip 内任意层级含 meta.properties 即可）
-zip -r 音色名.zip 音色名/
+zip -r 音色名.zip 音色名/     # 或用 tools/pack_zip.py
 ```
 
-App → 设置 → 音色 → 导入声音包 → 选 zip。单个包约 **320–450 MB**。
-
-> 需要批量处理多个角色时，可用社区脚本 `batch_make.py`（遍历目录找 `.pth`/`.ckpt` + 参考音频）。
-> 转换脚本涉及本机路径与环境变量，未随本仓库发布。
+App → 设置 → 音色 → 导入声音包 → 选 zip。单包约 **320–450 MB**。
 
 ## 🔒 隐私与数据
 

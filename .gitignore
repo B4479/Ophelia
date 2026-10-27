@@ -23,3 +23,7 @@ app/src/main/cpp/llama.cpp/
 # NDK/CMake 构建缓存
 .cxx/
 app/.cxx/
+
+# Python 缓存
+__pycache__/
+*.pyc
