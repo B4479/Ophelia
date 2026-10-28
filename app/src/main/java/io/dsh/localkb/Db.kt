@@ -55,6 +55,10 @@ data class LoreEntry(
     val mode: String = MODE_ALWAYS,   // always / keyword / vector
     val keys: String? = null,
     val emb: FloatArray? = null,
+    val keys2: String? = null,        // 次级关键词（selective 用）
+    val selective: Boolean = false,   // 主关键词 + 次级关键词都要命中
+    val caseSensitive: Boolean = false,
+    val scanDepth: Int = 0,           // 0=只看当前消息；N=再看最近 N 条
 )
 
 data class MessageRow(
@@ -119,6 +123,17 @@ data class Hit(
     val dense: Float = 0f,
 )
 
+data class TurnMemory(
+    val messageId: Long,
+    val text: String,
+    val emb: FloatArray,
+)
+
+data class ChatSummary(
+    val coveredTo: Long,
+    val text: String,
+)
+
 data class CloudModel(
     val id: Long,
     val type: String,
@@ -153,7 +168,7 @@ const val MODE_ALWAYS = "always"
 const val MODE_KEYWORD = "keyword"
 const val MODE_VECTOR = "vector"
 
-class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
+class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
 
     /** 首次安装引导：已有任一配置（云端 API / 本地对话模型）就直接标记完成。 */
     fun ensureOnboardingState(hasModel: Boolean) {
@@ -173,6 +188,10 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
             if ("mode" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN mode TEXT NOT NULL DEFAULT 'always'")
             if ("keys" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN keys TEXT")
             if ("emb" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN emb BLOB")
+            if ("keys2" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN keys2 TEXT")
+            if ("selective" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN selective INTEGER NOT NULL DEFAULT 0")
+            if ("case_sensitive" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN case_sensitive INTEGER NOT NULL DEFAULT 0")
+            if ("scan_depth" !in cols) writableDatabase.execSQL("ALTER TABLE lore_entry ADD COLUMN scan_depth INTEGER NOT NULL DEFAULT 0")
             android.util.Log.i("DbSchema", "lore columns ensured: $cols")
         }.onFailure { android.util.Log.e("DbSchema", "ensure lore columns failed: $it") }
     }
@@ -207,6 +226,10 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
         db.execSQL("CREATE TABLE chunk(id INTEGER PRIMARY KEY AUTOINCREMENT, kb_id INTEGER NOT NULL, doc_id INTEGER NOT NULL, page INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL, emb BLOB NOT NULL)")
         db.execSQL("CREATE TABLE setting(k TEXT PRIMARY KEY, v TEXT)")
         db.execSQL("CREATE TABLE cloud_model(id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, model TEXT NOT NULL, notes TEXT, created_at INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE chat_summary(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, covered_to INTEGER NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_summary_chat ON chat_summary(chat_id)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS turn_memory(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, text TEXT NOT NULL, emb BLOB NOT NULL, created_at INTEGER NOT NULL)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_memory_chat ON turn_memory(chat_id)")
         db.execSQL("CREATE TABLE model_source(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, builtin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX idx_chunk_kb ON chunk(kb_id)")
         createLoreTables(db)
@@ -259,6 +282,26 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
         if (oldVersion < 2) createCharacterTable(db)
         if (oldVersion < 3) createChatTables(db)
         val migrationErrors = ArrayList<String>()
+        if (oldVersion < 18) {
+            listOf(
+                "ALTER TABLE lore_entry ADD COLUMN keys2 TEXT",
+                "ALTER TABLE lore_entry ADD COLUMN selective INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE lore_entry ADD COLUMN case_sensitive INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE lore_entry ADD COLUMN scan_depth INTEGER NOT NULL DEFAULT 0"
+            ).forEach { sql -> runCatching { db.execSQL(sql) }.onFailure { android.util.Log.e("DbMigration", "lore2: $it") } }
+        }
+        if (oldVersion < 17) {
+            runCatching {
+                db.execSQL("CREATE TABLE IF NOT EXISTS turn_memory(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, text TEXT NOT NULL, emb BLOB NOT NULL, created_at INTEGER NOT NULL)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_memory_chat ON turn_memory(chat_id)")
+            }.onFailure { android.util.Log.e("DbMigration", "memory: $it") }
+        }
+        if (oldVersion < 16) {
+            runCatching {
+                db.execSQL("CREATE TABLE IF NOT EXISTS chat_summary(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, covered_to INTEGER NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_summary_chat ON chat_summary(chat_id)")
+            }.onFailure { android.util.Log.e("DbMigration", "summary: $it") }
+        }
         if (oldVersion < 15) {
             listOf(
                 "CREATE TABLE IF NOT EXISTS lorebook(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
@@ -494,6 +537,94 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
         writableDatabase.update("lorebook", cv, "id=?", arrayOf(id.toString()))
     }
 
+    fun addTurnMemory(chatId: Long, messageId: Long, text: String, emb: FloatArray) {
+        val cv = ContentValues().apply {
+            put("chat_id", chatId); put("message_id", messageId); put("text", text)
+            put("emb", floatsToBytes(emb)); put("created_at", System.currentTimeMillis())
+        }
+        writableDatabase.insert("turn_memory", null, cv)
+    }
+
+    fun listTurnMemories(chatId: Long, limit: Int = 500): List<TurnMemory> {
+        val out = ArrayList<TurnMemory>()
+        readableDatabase.rawQuery(
+            "SELECT message_id,text,emb FROM turn_memory WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+            arrayOf(chatId.toString(), limit.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(TurnMemory(c.getLong(0), c.getString(1), bytesToFloats(c.getBlob(2))))
+            }
+        }
+        return out
+    }
+
+    /** 最近 n 条消息拼成一段文本（世界书扫描范围用）。 */
+    fun recentMessagesText(chatId: Long, n: Int): String {
+        if (n <= 0) return ""
+        val parts = ArrayList<String>()
+        readableDatabase.rawQuery(
+            "SELECT content FROM message WHERE chat_id=? AND deleted=0 AND role IN ('user','assistant') ORDER BY id DESC LIMIT ?",
+            arrayOf(chatId.toString(), n.toString())
+        ).use { c -> while (c.moveToNext()) parts.add(c.getString(0)) }
+        parts.reverse()
+        return parts.joinToString("\n")
+    }
+
+    fun recentMessageIds(chatId: Long, n: Int): Set<Long> {
+        val ids = HashSet<Long>()
+        readableDatabase.rawQuery(
+            "SELECT id FROM message WHERE chat_id=? AND deleted=0 ORDER BY id DESC LIMIT ?",
+            arrayOf(chatId.toString(), n.toString())
+        ).use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
+        return ids
+    }
+
+    fun deleteTurnMemories(chatId: Long) {
+        writableDatabase.delete("turn_memory", "chat_id=?", arrayOf(chatId.toString()))
+    }
+
+    fun latestSummary(chatId: Long): ChatSummary? {
+        readableDatabase.rawQuery(
+            "SELECT covered_to,text FROM chat_summary WHERE chat_id=? ORDER BY covered_to DESC, id DESC LIMIT 1",
+            arrayOf(chatId.toString())
+        ).use { c ->
+            if (c.moveToNext()) return ChatSummary(c.getLong(0), c.getString(1))
+        }
+        return null
+    }
+
+    fun deleteSummary(chatId: Long) {
+        writableDatabase.delete("chat_summary", "chat_id=?", arrayOf(chatId.toString()))
+    }
+
+    fun addSummary(chatId: Long, coveredTo: Long, text: String) {
+        val cv = ContentValues().apply {
+            put("chat_id", chatId); put("covered_to", coveredTo)
+            put("text", text); put("created_at", System.currentTimeMillis())
+        }
+        writableDatabase.insert("chat_summary", null, cv)
+    }
+
+    fun messagesBetween(chatId: Long, afterId: Long, beforeIdExclusive: Long): List<MessageRow> {
+        val out = ArrayList<MessageRow>()
+        readableDatabase.rawQuery(
+            "SELECT id,chat_id,role,content,created_at,parent_id,model,edited,citations,attachments FROM message " +
+                "WHERE chat_id=? AND deleted=0 AND id>? AND id<? AND role IN ('user','assistant') ORDER BY id ASC",
+            arrayOf(chatId.toString(), afterId.toString(), beforeIdExclusive.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    MessageRow(
+                        c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), c.getLong(4),
+                        if (c.isNull(5)) null else c.getLong(5), c.getString(6), c.getInt(7) == 1,
+                        c.getString(8), c.getString(9)
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     fun countChatsUsingLorebook(id: Long): Int {
         readableDatabase.rawQuery("SELECT COUNT(*) FROM chat WHERE lorebook_id=?", arrayOf(id.toString())).use { c ->
             return if (c.moveToNext()) c.getInt(0) else 0
@@ -516,7 +647,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
 
     fun listLoreEntries(bookId: Long, onlyEnabled: Boolean = false): List<LoreEntry> {
         val out = ArrayList<LoreEntry>()
-        val sql = "SELECT id,book_id,title,content,enabled,sort,created_at,mode,keys,emb FROM lore_entry WHERE book_id=?" +
+        val sql = "SELECT id,book_id,title,content,enabled,sort,created_at,mode,keys,emb,keys2,selective,case_sensitive,scan_depth FROM lore_entry WHERE book_id=?" +
             (if (onlyEnabled) " AND enabled=1" else "") + " ORDER BY sort ASC, id ASC"
         readableDatabase.rawQuery(sql, arrayOf(bookId.toString())).use { c ->
             while (c.moveToNext()) {
@@ -527,7 +658,11 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
                         c.getInt(4) == 1, c.getInt(5), c.getLong(6),
                         mode = c.getString(7) ?: MODE_ALWAYS,
                         keys = c.getString(8),
-                        emb = embBytes?.let { bytesToFloats(it) }
+                        emb = embBytes?.let { bytesToFloats(it) },
+                        keys2 = c.getString(10),
+                        selective = c.getInt(11) == 1,
+                        caseSensitive = c.getInt(12) == 1,
+                        scanDepth = c.getInt(13)
                     )
                 )
             }
@@ -542,6 +677,10 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
         mode: String = MODE_ALWAYS,
         keys: String? = null,
         emb: FloatArray? = null,
+        keys2: String? = null,
+        selective: Boolean = false,
+        caseSensitive: Boolean = false,
+        scanDepth: Int = 0,
     ): Long {
         val maxSort = readableDatabase.rawQuery(
             "SELECT COALESCE(MAX(sort),0) FROM lore_entry WHERE book_id=?", arrayOf(bookId.toString())
@@ -550,6 +689,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
             put("book_id", bookId); put("title", title); put("content", content)
             put("enabled", 1); put("sort", maxSort + 1); put("created_at", System.currentTimeMillis())
             put("mode", mode); put("keys", keys)
+            put("keys2", keys2); put("selective", if (selective) 1 else 0)
+            put("case_sensitive", if (caseSensitive) 1 else 0); put("scan_depth", scanDepth)
             if (emb != null) put("emb", floatsToBytes(emb))
         }
         val id = writableDatabase.insert("lore_entry", null, cv)
@@ -565,13 +706,29 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
         mode: String = MODE_ALWAYS,
         keys: String? = null,
         emb: FloatArray? = null,
+        keys2: String? = null,
+        selective: Boolean = false,
+        caseSensitive: Boolean = false,
+        scanDepth: Int = 0,
     ) {
         val cv = ContentValues().apply {
             put("title", title); put("content", content); put("enabled", if (enabled) 1 else 0)
             put("mode", mode); put("keys", keys)
+            put("keys2", keys2); put("selective", if (selective) 1 else 0)
+            put("case_sensitive", if (caseSensitive) 1 else 0); put("scan_depth", scanDepth)
             if (emb != null) put("emb", floatsToBytes(emb))
         }
         writableDatabase.update("lore_entry", cv, "id=?", arrayOf(id.toString()))
+    }
+
+    /** 批量改模式 / 启停（mode=null 表示不动模式）。 */
+    fun bulkUpdateLoreEntries(bookId: Long, mode: String? = null, enabled: Boolean? = null) {
+        val cv = ContentValues()
+        mode?.let { cv.put("mode", it) }
+        enabled?.let { cv.put("enabled", if (it) 1 else 0) }
+        if (cv.size() == 0) return
+        writableDatabase.update("lore_entry", cv, "book_id=?", arrayOf(bookId.toString()))
+        touchLorebook(bookId)
     }
 
     fun deleteLoreEntry(id: Long) {
@@ -665,6 +822,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 15) {
     fun deleteChat(id: Long) {
         writableDatabase.delete("message", "chat_id=?", arrayOf(id.toString()))
         writableDatabase.delete("chat", "id=?", arrayOf(id.toString()))
+        writableDatabase.delete("turn_memory", "chat_id=?", arrayOf(id.toString()))
+        writableDatabase.delete("chat_summary", "chat_id=?", arrayOf(id.toString()))
     }
 
     fun addMessage(

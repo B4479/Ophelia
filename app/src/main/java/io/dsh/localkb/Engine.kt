@@ -238,12 +238,23 @@ object Llm {
         temperature: Double,
         onDelta: (String) -> Unit,
         canceller: StreamCanceller?,
+        params: GenParams? = null,
     ): Result<String> = runCatching {
         val body = JSONObject()
             .put("model", config.model)
             .put("messages", messages)
-            .put("temperature", temperature)
+            .put("temperature", params?.temperature ?: temperature)
             .put("stream", true)
+        params?.let { p ->
+            body.put("top_p", p.topP)
+            body.put("max_tokens", p.maxTokens)
+            if (p.stop.isNotEmpty()) body.put("stop", JSONArray(p.stop))
+            // 重复惩罚：>1 视为轻微抑制重复
+            if (p.repPenalty > 1.0) {
+                body.put("frequency_penalty", ((p.repPenalty - 1.0) * 0.5).coerceIn(0.0, 1.0))
+                body.put("presence_penalty", ((p.repPenalty - 1.0) * 0.3).coerceIn(0.0, 1.0))
+            }
+        }
 
         val url = config.baseUrl.trimEnd('/') + "/chat/completions"
         val req = Request.Builder()
@@ -304,6 +315,7 @@ object Llm {
         onDelta: (String) -> Unit,
         canceller: StreamCanceller? = null,
         temperature: Double = 0.85,
+        params: GenParams? = null,
     ): Result<String> {
         val messages = JSONArray()
         messages.put(JSONObject().put("role", "system").put("content", system))
@@ -311,7 +323,7 @@ object Llm {
             messages.put(JSONObject().put("role", role).put("content", content))
         }
         messages.put(JSONObject().put("role", "user").put("content", user))
-        return stream(config, messages, temperature, onDelta, canceller)
+        return stream(config, messages, temperature, onDelta, canceller, params)
     }
 
     fun answerStream(
@@ -320,6 +332,7 @@ object Llm {
         hits: List<Hit>,
         onDelta: (String) -> Unit,
         canceller: StreamCanceller? = null,
+        params: GenParams? = null,
     ): Result<String> {
         val ctx = StringBuilder()
         hits.forEachIndexed { i, h ->
@@ -334,7 +347,7 @@ object Llm {
             JSONObject().put("role", "user")
                 .put("content", "资料片段：\n" + ctx + "\n问题：" + question)
         )
-        return stream(config, messages, 0.2, onDelta, canceller)
+        return stream(config, messages, params?.temperature ?: 0.2, onDelta, canceller, params)
     }
 
     fun answerStreamCustom(
@@ -344,6 +357,7 @@ object Llm {
         hits: List<Hit>,
         onDelta: (String) -> Unit,
         canceller: StreamCanceller? = null,
+        params: GenParams? = null,
     ): Result<String> {
         val ctx = StringBuilder()
         hits.forEachIndexed { i, h ->
@@ -356,7 +370,7 @@ object Llm {
             JSONObject().put("role", "user")
                 .put("content", "资料片段：\n" + ctx + "\n问题：" + question)
         )
-        return stream(config, messages, 0.2, onDelta, canceller)
+        return stream(config, messages, params?.temperature ?: 0.2, onDelta, canceller, params)
     }
 
     fun answer(config: Config, question: String, hits: List<Hit>): Result<String> = runCatching {

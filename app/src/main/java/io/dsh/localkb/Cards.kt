@@ -43,6 +43,25 @@ object CardParser {
         }
     }
 
+    /** 取出卡片内嵌的世界书（data.character_book），没有返回 null。 */
+    fun extractCharacterBook(bytes: ByteArray): String? = runCatching {
+        val json = if (isPng(bytes)) extractPngJson(bytes) else String(bytes, Charsets.UTF_8).trim()
+        if (json == null || !json.startsWith("{")) return@runCatching null
+        val root = org.json.JSONObject(json)
+        val book = root.optJSONObject("data")?.optJSONObject("character_book")
+            ?: root.optJSONObject("character_book")
+            ?: return@runCatching null
+        val entries = book.opt("entries")
+        if (entries == null) return@runCatching null
+        val len = when (entries) {
+            is org.json.JSONArray -> entries.length()
+            is org.json.JSONObject -> entries.length()
+            else -> 0
+        }
+        if (len <= 0) return@runCatching null
+        book.toString()
+    }.getOrNull()
+
     /** 读 PNG 的 tEXt / iTXt 块，找角色卡 JSON（base64）。 */
     private fun extractPngJson(bytes: ByteArray): String? {
         var pos = 8
@@ -143,16 +162,36 @@ object CardParser {
         return root.toString(2)
     }
 
+    /** 去掉卡片里常见的 HTML 标签与实体，替换 ST 占位符。 */
+    fun cleanCardText(text: String, charName: String, userName: String?): String {
+        if (text.isBlank()) return ""
+        var s = text
+            .replace(Regex("<\\s*br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+            .replace(Regex("<\\s*/?\\s*(p|div|blockquote|h[1-6]|li|tr)\\s*[^>]*>", RegexOption.IGNORE_CASE), "\n")
+            .replace(Regex("<[^>]+>"), "")
+            .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'")
+            .replace("&nbsp;", " ")
+            .replace(Regex("\\n{3,}"), "\n\n")
+        s = s.replace(Regex("\\{\\{char\\}\\}", RegexOption.IGNORE_CASE), charName)
+        if (!userName.isNullOrBlank()) {
+            s = s.replace(Regex("\\{\\{user\\}\\}", RegexOption.IGNORE_CASE), userName)
+        }
+        return s.trim()
+    }
+
     /** 组装聊天用的系统提示。 */
-    fun systemPromptFor(card: CharacterCard): String {
+    fun systemPromptFor(card: CharacterCard, userName: String? = null): String {
+        fun c(x: String) = cleanCardText(x, card.name, userName)
         val sb = StringBuilder()
-        if (card.systemPrompt.isNotBlank()) sb.append(card.systemPrompt).append("\n\n")
+        val sys = c(card.systemPrompt)
+        if (sys.isNotBlank()) sb.append(sys).append("\n\n")
         sb.append("你要扮演角色「").append(card.name).append("」。")
-        if (card.description.isNotBlank()) sb.append("\n角色设定：").append(card.description)
-        if (card.personality.isNotBlank()) sb.append("\n性格：").append(card.personality)
-        if (card.scenario.isNotBlank()) sb.append("\n场景：").append(card.scenario)
-        if (card.mesExample.isNotBlank()) sb.append("\n对话示例（仅供风格参考）：\n").append(card.mesExample)
-        if (card.postHistory.isNotBlank()) sb.append("\n").append(card.postHistory)
+        c(card.description).takeIf { it.isNotBlank() }?.let { sb.append("\n角色设定：").append(it) }
+        c(card.personality).takeIf { it.isNotBlank() }?.let { sb.append("\n性格：").append(it) }
+        c(card.scenario).takeIf { it.isNotBlank() }?.let { sb.append("\n场景：").append(it) }
+        c(card.mesExample).takeIf { it.isNotBlank() }?.let { sb.append("\n对话示例（仅供风格参考）：\n").append(it) }
+        c(card.postHistory).takeIf { it.isNotBlank() }?.let { sb.append("\n").append(it) }
         sb.append("\n始终以「").append(card.name).append("」的第一人称说话，不要跳出角色，不要解释设定。")
         return sb.toString()
     }

@@ -18,6 +18,12 @@
 |---|---|---|
 | [spider996/atri-vc](https://github.com/spider996/atri-vc) | 中文 G2P 实现参考（`com/moe/gsvtts/TextFrontend.kt`）与 `assets/tts/` 词表（symbols / charmap / poly / p2s / phrases） | 见其仓库 LICENSE（GitHub 未识别为标准 SPDX 标识） |
 
+## 格式兼容（不含其代码）
+
+| 项目 | 用途 | 许可 |
+|---|---|---|
+| [SillyTavern](https://github.com/SillyTavern/SillyTavern) | 世界书 `World Info` JSON、角色卡 `character_book`、生成预设 JSON 的**格式兼容**（读取/写入同类文件，未复制其源码） | AGPL-3.0 |
+
 ## 应用依赖
 
 | 组件 | 用途 | 许可 |

@@ -54,6 +54,18 @@ fun LorebookListInline(
     LaunchedEffect(refreshKey) { reload() }
 
     Column(Modifier.fillMaxSize()) {
+        var stickyOn by remember { mutableStateOf(GenParamsStore.stickyEnabled(db)) }
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.weight(1f)) {
+                Text("命中后本会话保持注入", color = AppColors.text, fontSize = 13.sp)
+                Text("关闭则每轮重新判断（关键词/向量）", color = AppColors.muted, fontSize = 10.sp)
+            }
+            Switch(checked = stickyOn, onCheckedChange = {
+                stickyOn = it
+                scope.launch { withContext(Dispatchers.IO) { GenParamsStore.setSticky(db, it) } }
+            })
+        }
+        Spacer(Modifier.height(6.dp))
         if (books.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
@@ -161,6 +173,7 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
     var editing by remember { mutableStateOf<LoreEntry?>(null) }
     var adding by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<LoreEntry?>(null) }
+    var bulkOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
 
@@ -189,10 +202,47 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize().padding(horizontal = 14.dp)) {
-            Text(
-                "这些条目会在每次生成时注入模型。修改即时生效；删除或改动不会改写已有聊天记录。",
-                color = AppColors.muted, fontSize = 11.sp
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "这些条目会在每次生成时注入模型。修改即时生效；删除或改动不会改写已有聊天记录。",
+                    color = AppColors.muted, fontSize = 11.sp, modifier = Modifier.weight(1f)
+                )
+                Box {
+                    TextButton(onClick = { bulkOpen = true }) {
+                        Text("批量", color = AppColors.accent, fontSize = 12.sp)
+                    }
+                    DropdownMenu(expanded = bulkOpen, onDismissRequest = { bulkOpen = false }) {
+                        DropdownMenuItem(text = { Text("全部启用") }, onClick = {
+                            bulkOpen = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) { db.bulkUpdateLoreEntries(book.id, enabled = true) }
+                                reload()
+                            }
+                        })
+                        DropdownMenuItem(text = { Text("全部停用") }, onClick = {
+                            bulkOpen = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) { db.bulkUpdateLoreEntries(book.id, enabled = false) }
+                                reload()
+                            }
+                        })
+                        DropdownMenuItem(text = { Text("全部设为永久") }, onClick = {
+                            bulkOpen = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) { db.bulkUpdateLoreEntries(book.id, mode = MODE_ALWAYS) }
+                                reload()
+                            }
+                        })
+                        DropdownMenuItem(text = { Text("全部设为关键词") }, onClick = {
+                            bulkOpen = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) { db.bulkUpdateLoreEntries(book.id, mode = MODE_KEYWORD) }
+                                reload()
+                            }
+                        })
+                    }
+                }
+            }
             Spacer(Modifier.height(10.dp))
             if (entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -221,7 +271,7 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
                                 onCheckedChange = { v ->
                                     scope.launch {
                                         withContext(Dispatchers.IO) {
-                                            db.updateLoreEntry(e.id, e.title, e.content, v, e.mode, e.keys, e.emb)
+                                            db.updateLoreEntry(e.id, e.title, e.content, v, e.mode, e.keys, e.emb, e.keys2, e.selective, e.caseSensitive, e.scanDepth)
                                         }
                                         reload()
                                     }
@@ -242,7 +292,7 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
         LoreEntryDialog(
             existing = editing,
             onDismiss = { adding = false; editing = null },
-            onSave = { title, content, enabled, mode, keys ->
+            onSave = { title, content, enabled, mode, keys, keys2, selective, caseSensitive, scanDepth ->
                 scope.launch {
                     withContext(Dispatchers.IO) {
                         val old = editing
@@ -250,8 +300,11 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
                         val emb = if (needEmb) runCatching {
                             EmbedderHolder.get(context).embed(title + " " + content)
                         }.getOrNull() else null
-                        if (old == null) db.addLoreEntry(book.id, title, content, mode, keys, emb)
-                        else db.updateLoreEntry(old.id, title, content, enabled, mode, keys, emb)
+                        if (old == null) {
+                            db.addLoreEntry(book.id, title, content, mode, keys, emb, keys2, selective, caseSensitive, scanDepth)
+                        } else {
+                            db.updateLoreEntry(old.id, title, content, enabled, mode, keys, emb, keys2, selective, caseSensitive, scanDepth)
+                        }
                     }
                     adding = false
                     editing = null
@@ -287,13 +340,17 @@ fun LorebookDetailScreen(db: Db, book: Lorebook, onBack: () -> Unit) {
 private fun LoreEntryDialog(
     existing: LoreEntry?,
     onDismiss: () -> Unit,
-    onSave: (String, String, Boolean, String, String?) -> Unit,
+    onSave: (String, String, Boolean, String, String?, String?, Boolean, Boolean, Int) -> Unit,
 ) {
     var title by remember(existing) { mutableStateOf(existing?.title ?: "") }
     var content by remember(existing) { mutableStateOf(existing?.content ?: "") }
     var enabled by remember(existing) { mutableStateOf(existing?.enabled ?: true) }
     var mode by remember(existing) { mutableStateOf(existing?.mode ?: MODE_ALWAYS) }
     var keys by remember(existing) { mutableStateOf(existing?.keys ?: "") }
+    var keys2 by remember(existing) { mutableStateOf(existing?.keys2 ?: "") }
+    var selective by remember(existing) { mutableStateOf(existing?.selective ?: false) }
+    var caseSensitive by remember(existing) { mutableStateOf(existing?.caseSensitive ?: false) }
+    var scanDepth by remember(existing) { mutableStateOf(existing?.scanDepth ?: 0) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -328,6 +385,42 @@ private fun LoreEntryDialog(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    if (selective) {
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            keys2, { keys2 = it },
+                            label = { Text("次级关键词（也要命中才触发）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("大小写敏感", color = AppColors.muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        Switch(checked = caseSensitive, onCheckedChange = { caseSensitive = it })
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("需要次级关键词", color = AppColors.muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        Switch(checked = selective, onCheckedChange = { selective = it })
+                    }
+                    Text("扫描范围", color = AppColors.muted, fontSize = 11.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(0 to "当前消息", 3 to "最近 3 条", 6 to "最近 6 条").forEach { (d, label) ->
+                            val sel = scanDepth == d
+                            Surface(
+                                color = if (sel) AppColors.accent.copy(alpha = 0.14f) else AppColors.cardAlt,
+                                shape = RoundedCornerShape(10.dp),
+                                border = if (sel) androidx.compose.foundation.BorderStroke(1.dp, AppColors.accent) else null,
+                                modifier = Modifier.clickable { scanDepth = d }
+                            ) {
+                                Text(
+                                    label,
+                                    color = if (sel) AppColors.accent else AppColors.muted,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
                 }
                 Spacer(Modifier.height(6.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -340,9 +433,16 @@ private fun LoreEntryDialog(
         confirmButton = {
             TextButton(
                 onClick = {
-                    val ok = content.isNotBlank() && !(mode == MODE_KEYWORD && keys.isBlank())
-                    if (ok) onSave(title.trim(), content.trim(), enabled, mode, keys.trim().ifBlank { null }
-                        ?: keys.trim().takeIf { it.isNotEmpty() })
+                    val needKeys = mode == MODE_KEYWORD
+                    val ok = content.isNotBlank() && !(needKeys && keys.isBlank()) &&
+                        !(needKeys && selective && keys2.isBlank())
+                    if (ok) {
+                        onSave(
+                            title.trim(), content.trim(), enabled, mode,
+                            keys.trim().ifBlank { null }, keys2.trim().ifBlank { null },
+                            selective && needKeys, caseSensitive, scanDepth
+                        )
+                    }
                 }
             ) { Text("保存") }
         },
@@ -402,12 +502,32 @@ fun lorebookBlock(
     val entries = db.listLoreEntries(id, onlyEnabled = true)
     if (entries.isEmpty()) return null
 
+    val stickyOn = GenParamsStore.stickyEnabled(db)
+    val sticky = if (stickyOn) LoreSticky.set(chatId) else emptySet()
     val always = entries.filter { it.mode == MODE_ALWAYS }
+    // 关键词条目可能配置“扫描最近 N 条”，这里按最大深度一次性取回语料
+    val maxDepth = entries.filter { it.mode == MODE_KEYWORD }
+        .maxOfOrNull { it.scanDepth } ?: 0
+    val recentText = if (maxDepth > 0) {
+        runCatching { db.recentMessagesText(chatId, maxDepth) }.getOrDefault("")
+    } else ""
+    fun corpusFor(e: LoreEntry): String =
+        if (e.scanDepth > 0) recentText + "\n" + query else query
+    fun hitKeys(text: String, raw: String?, caseSensitive: Boolean): Boolean =
+        splitKeys(raw).any { k ->
+            if (caseSensitive) text.contains(k) else text.contains(k, ignoreCase = true)
+        }
+
+    // 关键词模式：主关键词命中（selective 时还要命中次级关键词）；本会话命中过之后保持（粘性）
     val keywordHits = entries.filter { e ->
-        e.mode == MODE_KEYWORD && splitKeys(e.keys).any { k -> query.contains(k, ignoreCase = true) }
+        if (e.mode != MODE_KEYWORD) return@filter false
+        if (e.id in sticky) return@filter true
+        val corpus = corpusFor(e)
+        val primary = hitKeys(corpus, e.keys, e.caseSensitive)
+        if (!primary) return@filter false
+        if (e.selective) hitKeys(corpus, e.keys2, e.caseSensitive) else true
     }
     // 向量模式：命中过的本会话保持（粘性），否则按相似度 >= 0.60 判定
-    val sticky = LoreSticky.set(chatId)
     val vectorEntries = entries.filter { it.mode == MODE_VECTOR }
     val vectorHits = ArrayList<LoreEntry>()
     if (vectorEntries.isNotEmpty()) {

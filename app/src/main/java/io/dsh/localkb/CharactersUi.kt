@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -100,6 +101,7 @@ private data class EditorState(
 private data class PendingImport(
     val card: CharacterCard,
     val avatarPath: String?,
+    val bookJson: String? = null,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -115,6 +117,7 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
     var msg by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableStateOf(0) }              // 0=角色卡 1=世界书
     var showNewLorebook by remember { mutableStateOf(false) }
+    var showLoreAddMenu by remember { mutableStateOf(false) }
     var loreRefresh by remember { mutableStateOf(0) }
     var detailBook by remember { mutableStateOf<Lorebook?>(null) }
 
@@ -130,7 +133,7 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
                 runCatching {
                     val bytes = context.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
                     val card = CardParser.parse(bytes) ?: error("无法识别（只支持 V2 PNG 或 JSON 角色卡）")
-                    PendingImport(card, saveAvatar(context, bytes))
+                    PendingImport(card, saveAvatar(context, bytes), CardParser.extractCharacterBook(bytes))
                 }
             }
             r.onSuccess { pending = it }
@@ -151,7 +154,7 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { if (tab == 0) showAddMenu = true else showNewLorebook = true },
+                onClick = { if (tab == 0) showAddMenu = true else showLoreAddMenu = true },
                 containerColor = CAccent
             ) {
                 Icon(Icons.Filled.Add, if (tab == 0) "添加角色卡" else "新建集锦", tint = AppColors.onAccent)
@@ -217,6 +220,56 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
         }
     }
 
+    // 世界书：导入 JSON
+    val loreImporter = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val r = withContext(Dispatchers.IO) { runCatching { LoreImport.importInto(context, db, uri) } }
+            r.onSuccess {
+                msg = "已导入《${it.bookName}》：${it.imported} 条" + if (it.skipped > 0) "，跳过 ${it.skipped} 条" else ""
+                loreRefresh++
+            }.onFailure {
+                msg = "导入失败：${it.message ?: "格式无法识别"}"
+            }
+        }
+    }
+
+    if (showLoreAddMenu) {
+        AlertDialog(
+            onDismissRequest = { showLoreAddMenu = false },
+            containerColor = AppColors.card,
+            titleContentColor = AppColors.text,
+            textContentColor = AppColors.text,
+            title = { Text("新建世界书") },
+            text = {
+                Column {
+                    ListItem(
+                        headlineContent = { Text("新建空集锦") },
+                        supportingContent = { Text("从零开始添加世界观条目", color = AppColors.muted, fontSize = 11.sp) },
+                        leadingContent = { Icon(Icons.Filled.Add, null, tint = AppColors.accent) },
+                        modifier = Modifier.clickable {
+                            showLoreAddMenu = false
+                            showNewLorebook = true
+                        }
+                    )
+                    ListItem(
+                        headlineContent = { Text("导入世界书（JSON）") },
+                        supportingContent = {
+                            Text("支持 SillyTavern / 酒馆世界书，自动按关键词归类", color = AppColors.muted, fontSize = 11.sp)
+                        },
+                        leadingContent = { Icon(Icons.Filled.FileDownload, null, tint = AppColors.accent) },
+                        modifier = Modifier.clickable {
+                            showLoreAddMenu = false
+                            loreImporter.launch(arrayOf("application/json", "text/plain", "*/*"))
+                        }
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { showLoreAddMenu = false }) { Text("取消") } }
+        )
+    }
+
     if (showNewLorebook) {
         NewLorebookDialog(
             onDismiss = { showNewLorebook = false },
@@ -267,11 +320,18 @@ fun CharacterScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit) {
             pending = p,
             onConfirm = {
                 scope.launch {
-                    withContext(Dispatchers.IO) {
-                        db.addCharacter(p.card.copy(avatarPath = p.avatarPath), autoVoiceFor(p.card.name))
+                    val extra = withContext(Dispatchers.IO) {
+                        val id = db.addCharacter(p.card.copy(avatarPath = p.avatarPath), autoVoiceFor(p.card.name))
+                        p.bookJson?.let { js ->
+                            runCatching { LoreImport.importCharacterBook(db, p.card.name, js) }.getOrNull()
+                                ?.let { (bookId, n) ->
+                                    db.setSetting("char_lore_$id", bookId.toString())
+                                    n
+                                }
+                        }
                     }
                     pending = null
-                    msg = "已导入：${p.card.name}"
+                    msg = "已导入：${p.card.name}" + if (extra != null) "（内含世界书 $extra 条）" else ""
                     reload()
                 }
             },

@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Settings
@@ -58,6 +59,7 @@ fun SettingsScreen(db: Db, tts: TtsPlayer, onBack: () -> Unit, initialPage: Stri
         "profile" -> ProfileScreen(db) { page = "root" }
         "logs" -> DebugLogScreen(db) { page = "root" }
         "theme" -> ThemeScreen(db) { page = "root" }
+        "genparams" -> GlobalGenParamsScreen(db) { page = "root" }
         else -> SettingsHome(db, tts, onBack) { page = it }
     }
 }
@@ -119,6 +121,13 @@ private fun SettingsHome(db: Db, tts: TtsPlayer, onBack: () -> Unit, onOpen: (St
                 title = "模型选择",
                 subtitle = "当前：$modelText",
                 onClick = { onOpen("model") }
+            )
+            Spacer(Modifier.height(10.dp))
+            ModuleRow(
+                icon = Icons.Filled.Tune,
+                title = "生成参数（全局）",
+                subtitle = "温度 ${GenParamsStore.global(db).temperature} · 长度 ${GenParamsStore.global(db).maxTokens}",
+                onClick = { onOpen("genparams") }
             )
             Spacer(Modifier.height(10.dp))
             ModuleRow(
@@ -667,4 +676,78 @@ private fun testConnection(base: String, key: String): String {
             }
         }
     }.getOrElse { "连接失败：${it.message}" }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GlobalGenParamsScreen(db: Db, onBack: () -> Unit) {
+    var p by remember { mutableStateOf(GenParamsStore.global(db)) }
+    fun save(next: GenParams) {
+        p = next
+        GenParamsStore.saveGlobal(db, next)
+    }
+    Scaffold(
+        containerColor = SBg,
+        topBar = {
+            TopAppBar(
+                title = { Text("生成参数（全局）", fontWeight = FontWeight.SemiBold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = AppColors.text)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = SBg, titleContentColor = AppColors.text)
+            )
+        }
+    ) { pad ->
+        Column(
+            Modifier.padding(pad).fillMaxSize().padding(horizontal = 16.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            Text(
+                "所有“跟随全局”的会话都用这套参数；单个会话可在对话顶栏的滑杆里单独覆盖。",
+                color = AppColors.muted, fontSize = 11.sp
+            )
+            Spacer(Modifier.height(10.dp))
+            SliderRow("温度", p.temperature.toFloat(), 0f..1.5f, String.format("%.2f", p.temperature)) {
+                save(p.copy(temperature = it.toDouble()))
+            }
+            SliderRow("top_p", p.topP.toFloat(), 0.1f..1f, String.format("%.2f", p.topP)) {
+                save(p.copy(topP = it.toDouble()))
+            }
+            SliderRow("top_k", p.topK.toFloat(), 0f..100f, "${p.topK}") {
+                save(p.copy(topK = it.toInt()))
+            }
+            Text("top_k 仅本地模型生效", color = AppColors.muted, fontSize = 10.sp)
+            SliderRow("最大输出", p.maxTokens.toFloat(), 64f..2048f, "${p.maxTokens}") {
+                save(p.copy(maxTokens = (it / 16).toInt() * 16))
+            }
+            SliderRow("重复惩罚", p.repPenalty.toFloat(), 1f..1.5f, String.format("%.2f", p.repPenalty)) {
+                save(p.copy(repPenalty = it.toDouble()))
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = p.stop.joinToString("\n"),
+                onValueChange = { text ->
+                    save(p.copy(stop = text.split("\n").map { it.trim() }.filter { it.isNotEmpty() }))
+                },
+                label = { Text("停止词（每行一个）") },
+                minLines = 2, maxLines = 4,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(14.dp))
+            TextButton(onClick = { save(GenParams()) }) {
+                Text("恢复默认", color = AppColors.muted, fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SliderRow(label: String, value: Float, range: ClosedFloatingPointRange<Float>, show: String, onChange: (Float) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = AppColors.text, fontSize = 13.sp, modifier = Modifier.width(74.dp))
+        Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.weight(1f))
+        Text(show, color = AppColors.muted, fontSize = 12.sp, modifier = Modifier.width(52.dp))
+    }
 }

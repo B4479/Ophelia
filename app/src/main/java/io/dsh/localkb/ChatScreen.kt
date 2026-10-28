@@ -3,6 +3,7 @@ package io.dsh.localkb
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,6 +37,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VolumeUp
@@ -229,6 +231,12 @@ fun ChatScreen(
     var newChatLoreName by remember { mutableStateOf<String?>(null) }
     var showNewChatLorePicker by remember { mutableStateOf(false) }
     var showOnboarding by remember { mutableStateOf(db.getSetting("onboarding_done") == "0") }
+    var showGenPanel by remember { mutableStateOf(false) }
+    var genParams by remember { mutableStateOf(GenParams()) }
+    var showMemoryDialog by remember { mutableStateOf(false) }
+    var memSummary by remember { mutableStateOf<ChatSummary?>(null) }
+    var memCount by remember { mutableStateOf(0) }
+    var memBusy by remember { mutableStateOf(false) }
     var currentLoreName by remember { mutableStateOf<String?>(null) }
     var showCharPicker by remember { mutableStateOf(false) }
     var showNewWorkMenu by remember { mutableStateOf(false) }
@@ -290,6 +298,7 @@ fun ChatScreen(
         current = row
         withContext(Dispatchers.IO) { db.setSetting("last_chat_id", row.id.toString()) }
         messages = withContext(Dispatchers.IO) { db.messages(row.id) }
+        genParams = withContext(Dispatchers.IO) { GenParamsStore.effective(db, row.id, row.mode) }
         currentLoreName = withContext(Dispatchers.IO) {
             row.lorebookId?.let { id -> runCatching { db.lorebookById(id)?.name }.getOrNull() }
         }
@@ -466,6 +475,7 @@ fun ChatScreen(
         if (provider == "cloud" && cfg == null) {
             return "（未配置云端模型：请到 设置 → 模型选择 添加云端 API，或切换为本地模型）" to "none"
         }
+        val gp = GenParamsStore.effective(db, chat.id, chat.mode)
         val localCatalog = ModelPrefs.localModel(chatSel)
         val localFile = localCatalog?.let { Catalog.file(context, it) }
         val localLabel = localCatalog?.id ?: "qwen2.5-1.5b"
@@ -475,30 +485,66 @@ fun ChatScreen(
                 db.listCharacters().firstOrNull { it.id == cid }?.let { cr -> CardParser.fromJson(cr.cardJson, null) }
             }
         }
+        val budget = PromptPolicy.forMode(chat.mode, provider)
         val assistantBlock = chat.assistantPrompt?.takeIf { it.isNotBlank() }
-        val personaCore = card?.let { CardParser.systemPromptFor(it) }
+        val personaCore = card?.let { CardParser.systemPromptFor(it, ProfileStore.displayName(db)) }
             ?: "你是一个中文助手。默认用简体中文回答；回答简洁自然，不要重复用户的问题，也不要输出任何标记或特殊符号。"
         val personaBase = if (assistantBlock != null) "$assistantBlock\n\n$personaCore" else personaCore
-        // 世界书：绑定了集锦就拼进系统提示词（上限 2000 字，见 lorebookBlock）
-        val loreBlock = if (chat.mode == MODE_CHAT) {
+        val personaFixed = PromptPolicy.trim(personaBase, budget.persona)
+        // 世界书：绑定了集锦就拼进系统提示词（按预算裁剪）
+        val loreBlock = if (chat.mode == MODE_CHAT && budget.lore > 0) {
             withContext(Dispatchers.IO) {
                 runCatching { lorebookBlock(context, db, chat.id, chat.lorebookId, userText) }.getOrNull()
             }
         } else null
-        val withLore = if (loreBlock.isNullOrBlank()) personaBase else "$personaBase\n\n$loreBlock"
-        val persona = ProfileStore.augment(db, withLore)
+        val loreText = loreBlock?.let { PromptPolicy.trim(it, budget.lore) }.orEmpty()
+        // 长会话记要（摘要）
+        val summaryText = withContext(Dispatchers.IO) { db.latestSummary(chat.id)?.text }
+            ?.let { PromptPolicy.trim(it, budget.summary) }
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                if (chat.mode == MODE_WORK) "【会话记要（结论/依据/待办）】\n$it"
+                else "【前情摘要】\n$it"
+            }.orEmpty()
+        val memoryText = if (budget.memory > 0) {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val hits = LongMemory.recall(context, db, chat.id, userText)
+                    LongMemory.format(hits, budget.memory)
+                }.getOrDefault("")
+            }
+        } else ""
+        val presetPrompt = gp.systemPrompt?.takeIf { it.isNotBlank() }
+            ?.let { PromptPolicy.trim(it, budget.persona) }
+            .orEmpty()
+        val persona = ProfileStore.augment(
+            db,
+            listOf(presetPrompt, personaFixed, loreText, summaryText, memoryText).filter { it.isNotBlank() }.joinToString("\n\n")
+        )
+
+        withContext(Dispatchers.IO) {
+            runCatching {
+                db.log(
+                    "prompt", chat.id, provider,
+                    "persona=${persona.length} lore=${loreText.length} summary=${summaryText.length} memory=${memoryText.length} temp=${gp.temperature} max=${gp.maxTokens}"
+                )
+            }
+        }
 
         if (chat.mode == MODE_WORK) {
             val kbIds = kbIdsOf(chat)
             if (kbIds.isEmpty()) {
                 // 没有引用知识库：直接当普通对话
-                val history = withContext(Dispatchers.IO) { db.messages(chat.id) }
-                    .filter { it.id != parentId && (it.role == "user" || it.role == "assistant") }
-                    .map { (if (it.role == "user") "user" else "assistant") to it.content }
+                val history = PromptPolicy.fitHistory(
+                    withContext(Dispatchers.IO) { db.messages(chat.id) }
+                        .filter { it.id != parentId && (it.role == "user" || it.role == "assistant") }
+                        .map { (if (it.role == "user") "user" else "assistant") to it.content },
+                    budget.history
+                )
                 return if (provider == "local") {
                     localCancel.set(false)
                     withContext(Dispatchers.IO) {
-                        LocalLlm.chat(context, persona, history, userText, maxTokens = 256) { piece ->
+                        LocalLlm.chat(context, persona, history, userText, maxTokens = gp.maxTokens, temperature = gp.temperature.toFloat()) { piece ->
                             onDelta(piece)
                             !localCancel.get()
                         }
@@ -506,7 +552,7 @@ fun ChatScreen(
                 } else {
                     val c = StreamCanceller()
                     canceller = c
-                    withContext(Dispatchers.IO) { Llm.chatStream(cfg!!, persona, history, userText, onDelta, c) }
+                    withContext(Dispatchers.IO) { Llm.chatStream(cfg!!, persona, history, userText, onDelta, c, params = gp) }
                         .getOrElse { "（生成失败：${it.message}）" } to ("cloud:" + cfg!!.model)
                 }
             }
@@ -522,8 +568,20 @@ fun ChatScreen(
             lastTopK = usedTopKs.maxOrNull() ?: 5
             lastHitCount = hits.size
             lastTopScore = hits.maxOfOrNull { it.dense } ?: 0f
-            // P2-2：本地模型只注入前 2 段，引用也只保留这 2 条
-            val citedHits = if (provider == "local") hits.take(2) else hits
+            // 按预算装片段：本地每段更短，云端可放更长；只把真正装进去的算作引用
+            val perChunk = if (provider == "local") 220 else 420
+            val kbBudget = if (budget.kb > 0) budget.kb else if (provider == "local") 1600 else 3800
+            val included = ArrayList<Hit>()
+            var usedChars = 0
+            for (h in hits) {
+                val body = PromptPolicy.trim(h.text, perChunk)
+                val cost = body.length + h.docName.length + 24
+                if (usedChars + cost > kbBudget && included.isNotEmpty()) break
+                included.add(h)
+                usedChars += cost
+                if (usedChars >= kbBudget) break
+            }
+            val citedHits = included
             lastCitations = org.json.JSONArray().apply {
                 citedHits.forEachIndexed { i, h ->
                     put(
@@ -548,10 +606,8 @@ fun ChatScreen(
             }.toString()
 
             return if (provider == "local") {
-                // 本地模型上下文要短：只取前 2 段、每段截 250 字，否则 prefill 太慢
-                val ctxText = hits.take(2).mapIndexed { i, h ->
-                    val body = if (h.text.length > 250) h.text.take(250) + "…" else h.text
-                    "[${i + 1}]《${h.docName}》第${h.page}页\n$body"
+                val ctxText = included.take(2).mapIndexed { i, h ->
+                    "[${i + 1}]《${h.docName}》第${h.page}页\n" + PromptPolicy.trim(h.text, 250)
                 }.joinToString("\n\n")
                 val sys = ProfileStore.augment(
                     db,
@@ -561,7 +617,7 @@ fun ChatScreen(
                 val question = "资料片段：\n$ctxText\n\n问题：$userText"
                 localCancel.set(false)
                 withContext(Dispatchers.IO) {
-                    LocalLlm.chat(context, sys, emptyList(), question, maxTokens = 256, modelFile = localFile) { piece ->
+                    LocalLlm.chat(context, sys, emptyList(), question, maxTokens = gp.maxTokens, temperature = gp.temperature.toFloat(), modelFile = localFile) { piece ->
                         onDelta(piece)
                         !localCancel.get()
                     }
@@ -572,12 +628,12 @@ fun ChatScreen(
                 val sys = (if (assistantBlock != null) "$assistantBlock\n" else "") +
                     "你是一个严谨的知识库助手。只能依据给定的资料片段回答；资料不足直接说“资料中没有提到”。引用用 [1][2] 标注。"
                 withContext(Dispatchers.IO) {
-                    Llm.answerStreamCustom(cfg!!, ProfileStore.augment(db, sys), userText, hits, onDelta, c)
+                    Llm.answerStreamCustom(cfg!!, ProfileStore.augment(db, sys), userText, included, onDelta, c, gp)
                 }.getOrElse { "（生成失败：${it.message}）" } to ("cloud:" + cfg!!.model)
             }
         }
 
-        val history = withContext(Dispatchers.IO) { db.messages(chat.id) }
+        val historyAll = withContext(Dispatchers.IO) { db.messages(chat.id) }
             .filter { it.id != parentId }
             .filter { it.role == "user" || it.role == "assistant" }
             .map { m ->
@@ -597,10 +653,11 @@ fun ChatScreen(
                     m.content + "\n\n" + parts.joinToString("\n\n")
                 (if (m.role == "user") "user" else "assistant") to content
             }
+        val history = PromptPolicy.fitHistory(historyAll, budget.history)
         return if (provider == "local") {
             localCancel.set(false)
             withContext(Dispatchers.IO) {
-                LocalLlm.chat(context, persona, history, userText, maxTokens = 256, modelFile = localFile) { piece ->
+                LocalLlm.chat(context, persona, history, userText, maxTokens = gp.maxTokens, temperature = gp.temperature.toFloat(), modelFile = localFile) { piece ->
                     onDelta(piece)
                     !localCancel.get()
                 }
@@ -608,7 +665,7 @@ fun ChatScreen(
         } else {
             val c = StreamCanceller()
             canceller = c
-            withContext(Dispatchers.IO) { Llm.chatStream(cfg!!, persona, history, userText, onDelta, c) }
+            withContext(Dispatchers.IO) { Llm.chatStream(cfg!!, persona, history, userText, onDelta, c, params = gp) }
                 .getOrElse { "（生成失败：${it.message}）" } to ("cloud:" + cfg!!.model)
         }
     }
@@ -743,6 +800,21 @@ fun ChatScreen(
                     db.log("send", id, modelLabel, text.take(40))
                     db.touchChat(row.id)
                     if (messages.count { it.role == "user" } == 1) db.touchChat(row.id, text.take(14))
+                    // 长记忆：把这轮问答写成可检索片段
+                    runCatching {
+                        val memUser = if (row.mode == MODE_WORK) "" else text
+                        LongMemory.remember(context, db, row.id, id, memUser, reply)
+                    }
+                    // 长会话：超过窗口就压缩早期对话（失败静默，不影响本轮）
+                    runCatching {
+                        val chatSel = ModelPrefs.chatSel(db)
+                        val prov = if (ModelPrefs.isCloud(chatSel)) "cloud" else "local"
+                        val cfg = ModelPrefs.cloudModel(db, chatSel)?.let {
+                            Llm.Config(it.baseUrl, it.apiKey, it.model)
+                        } ?: Llm.loadConfig(db)
+                        val localFile = ModelPrefs.localModel(chatSel)?.let { Catalog.file(context, it) }
+                        ChatSummarizer.maybeSummarize(context, db, row, prov, cfg, localFile)
+                    }
                 }
                 reloadLists()
             } catch (t: Throwable) {
@@ -954,8 +1026,16 @@ fun ChatScreen(
                                     text = { Text("音色") },
                                     onClick = { menuOpen = false; showVoicePicker = true }
                                 )
+                                DropdownMenuItem(
+                                    text = { Text("会话记忆") },
+                                    onClick = { menuOpen = false; showMemoryDialog = true }
+                                )
                             }
                         }
+                        IconButton(onClick = {
+                            genParams = GenParamsStore.effective(db, current?.id ?: 0L, current?.mode ?: MODE_CHAT)
+                            showGenPanel = true
+                        }) { Icon(Icons.Filled.Tune, "生成参数", tint = AppColors.text) }
                         IconButton(onClick = { onOpenSettings("root") }) { Icon(Icons.Filled.Settings, "设置", tint = AppColors.text) }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = ChBg, titleContentColor = AppColors.text)
@@ -1200,7 +1280,7 @@ fun ChatScreen(
                                                     tts.stop()
                                                 } else {
                                                     val readActions = db.getSetting("tts_read_actions") == "1"
-                                                    val speakText = if (readActions) m.content else stripAction(m.content)
+                                                    val speakText = if (current?.mode == MODE_WORK) stripAction(m.content) else ttsText(m.content, readActions)
                                                     if (speakText.isBlank()) {
                                                         android.widget.Toast.makeText(
                                                             context, "这条消息只有动作描写", android.widget.Toast.LENGTH_SHORT
@@ -1293,6 +1373,211 @@ fun ChatScreen(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                         )
                     }
+                }
+            }
+        }
+    }
+
+    // ---------- 会话记忆（摘要 + 长记忆） ----------
+    if (showMemoryDialog && current != null) {
+        val cr = current!!
+        LaunchedEffect(showMemoryDialog) {
+            withContext(Dispatchers.IO) {
+                memSummary = db.latestSummary(cr.id)
+                memCount = runCatching { db.listTurnMemories(cr.id, 1000).size }.getOrDefault(0)
+            }
+        }
+        val chatSel = ModelPrefs.chatSel(db)
+        val provider = if (ModelPrefs.isCloud(chatSel)) "cloud" else "local"
+        AlertDialog(
+            onDismissRequest = { showMemoryDialog = false },
+            containerColor = AppColors.card,
+            titleContentColor = AppColors.text,
+            textContentColor = AppColors.text,
+            title = { Text("会话记忆") },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                    Text("摘要", color = AppColors.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    val sum = memSummary
+                    Text(
+                        if (sum == null) "还没有摘要（对话超过 20 条会自动生成）"
+                        else "已覆盖前 ${sum.coveredTo} 条 · ${sum.text.length} 字",
+                        color = AppColors.muted, fontSize = 12.sp
+                    )
+                    sum?.let {
+                        Spacer(Modifier.height(6.dp))
+                        Text(it.text, color = AppColors.muted, fontSize = 11.sp, maxLines = 8)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row {
+                        TextButton(enabled = !memBusy, onClick = {
+                            scope.launch {
+                                memBusy = true
+                                withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        val cfg = ModelPrefs.cloudModel(db, chatSel)?.let {
+                                            Llm.Config(it.baseUrl, it.apiKey, it.model)
+                                        } ?: Llm.loadConfig(db)
+                                        val localFile = ModelPrefs.localModel(chatSel)?.let { Catalog.file(context, it) }
+                                        ChatSummarizer.summarizeNow(context, db, cr, provider, cfg, localFile)
+                                    }
+                                    memSummary = db.latestSummary(cr.id)
+                                }
+                                memBusy = false
+                                notice = if (memSummary == null) "摘要生成失败" else "摘要已更新"
+                            }
+                        }) { Text(if (memBusy) "生成中…" else "重新摘要", color = AppColors.accent, fontSize = 13.sp) }
+                        TextButton(enabled = memSummary != null, onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) { db.deleteSummary(cr.id) }
+                                memSummary = null
+                            }
+                        }) { Text("清空摘要", color = AppColors.muted, fontSize = 13.sp) }
+                    }
+                    Divider(color = AppColors.divider)
+                    Spacer(Modifier.height(8.dp))
+                    Text("长记忆", color = AppColors.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text("$memCount 条（最近 6 条不参与召回）", color = AppColors.muted, fontSize = 12.sp)
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(enabled = memCount > 0, onClick = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) { db.deleteTurnMemories(cr.id) }
+                            memCount = 0
+                        }
+                    }) { Text("清空记忆", color = AppColors.danger, fontSize = 13.sp) }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showMemoryDialog = false }) { Text("关闭") } }
+        )
+    }
+
+    // ---------- 生成参数（ST 面板） ----------
+    if (showGenPanel && current != null) {
+        val chatRow = current!!
+        val presetPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                val text = withContext(Dispatchers.IO) {
+                    runCatching {
+                        context.contentResolver.openInputStream(uri)?.use {
+                            it.bufferedReader(Charsets.UTF_8).readText()
+                        }
+                    }.getOrNull()
+                }
+                val parsed = text?.let { GenParams.fromStPreset(it) }
+                if (parsed == null) {
+                    notice = "预设解析失败：不是有效的 ST 预设 JSON"
+                } else {
+                    genParams = parsed
+                    withContext(Dispatchers.IO) { GenParamsStore.saveChat(db, chatRow.id, parsed) }
+                    notice = "已导入预设：温度 ${parsed.temperature}，长度 ${parsed.maxTokens}" +
+                        if (parsed.systemPrompt != null) "，含系统提示词" else ""
+                }
+            }
+        }
+        fun persist(p: GenParams) {
+            genParams = p
+            scope.launch { withContext(Dispatchers.IO) { GenParamsStore.saveChat(db, chatRow.id, p) } }
+        }
+        ModalBottomSheet(
+            onDismissRequest = { showGenPanel = false },
+            containerColor = AppColors.card,
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp).padding(bottom = 28.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("生成设置", color = AppColors.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f))
+                    Text("跟随全局", color = AppColors.muted, fontSize = 12.sp)
+                    Spacer(Modifier.width(6.dp))
+                    Switch(
+                        checked = genParams.followGlobal,
+                        onCheckedChange = { persist(genParams.copy(followGlobal = it)) }
+                    )
+                }
+                Text(
+                    if (genParams.followGlobal) "当前跟随全局设置；关闭后只对本次会话生效。"
+                    else "只对本次会话生效。",
+                    color = AppColors.muted, fontSize = 11.sp
+                )
+                Spacer(Modifier.height(10.dp))
+
+                @Composable
+                fun slider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, show: String, onChange: (Float) -> Unit) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(label, color = AppColors.text, fontSize = 13.sp, modifier = Modifier.width(74.dp))
+                        Slider(
+                            value = value, onValueChange = onChange,
+                            valueRange = range,
+                            enabled = !genParams.followGlobal,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(show, color = AppColors.muted, fontSize = 12.sp, modifier = Modifier.width(52.dp))
+                    }
+                }
+
+                slider("温度", genParams.temperature.toFloat(), 0f..1.5f,
+                    String.format("%.2f", genParams.temperature)) {
+                    var v = it.toDouble()
+                    if (chatRow.mode == MODE_WORK && v > 0.6) v = 0.6
+                    persist(genParams.copy(temperature = v))
+                }
+                if (chatRow.mode == MODE_WORK) {
+                    Text("工作任务的温度上限为 0.60", color = AppColors.muted, fontSize = 10.sp)
+                }
+                slider("top_p", genParams.topP.toFloat(), 0.1f..1f,
+                    String.format("%.2f", genParams.topP)) { persist(genParams.copy(topP = it.toDouble())) }
+                slider("top_k", genParams.topK.toFloat(), 0f..100f, "${genParams.topK}") {
+                    persist(genParams.copy(topK = it.toInt()))
+                }
+                Text("top_k 仅本地模型生效", color = AppColors.muted, fontSize = 10.sp)
+                slider("最大输出", genParams.maxTokens.toFloat(), 64f..2048f, "${genParams.maxTokens}") {
+                    persist(genParams.copy(maxTokens = (it / 16).toInt() * 16))
+                }
+                slider("重复惩罚", genParams.repPenalty.toFloat(), 1f..1.5f,
+                    String.format("%.2f", genParams.repPenalty)) {
+                    persist(genParams.copy(repPenalty = it.toDouble()))
+                }
+
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = genParams.stop.joinToString("\n"),
+                    onValueChange = { text ->
+                        val list = text.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+                        persist(genParams.copy(stop = list))
+                    },
+                    label = { Text("停止词（每行一个）") },
+                    enabled = !genParams.followGlobal,
+                    minLines = 2, maxLines = 4,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = genParams.systemPrompt.orEmpty(),
+                    onValueChange = { text ->
+                        persist(genParams.copy(systemPrompt = text.takeIf { it.isNotBlank() }))
+                    },
+                    label = { Text("预设系统提示词（导入 ST 预设时自动填入）") },
+                    enabled = !genParams.followGlobal,
+                    minLines = 3, maxLines = 8,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { presetPicker.launch(arrayOf("application/json", "text/plain", "*/*")) }) {
+                        Text("导入 ST 预设", color = AppColors.accent, fontSize = 13.sp)
+                    }
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = {
+                        val d = GenParams()
+                        genParams = d
+                        scope.launch { withContext(Dispatchers.IO) { GenParamsStore.clearChat(db, chatRow.id) } }
+                    }) { Text("恢复默认", color = AppColors.muted, fontSize = 13.sp) }
                 }
             }
         }
@@ -1426,6 +1711,15 @@ fun ChatScreen(
                                 },
                                 modifier = Modifier.clickable {
                                     showCharPicker = false
+                                    // 卡片自带世界书时自动预选
+                                    if (newChatLorebookId == null) {
+                                        db.getSetting("char_lore_${cr.id}")?.toLongOrNull()?.let { bid ->
+                                            runCatching { db.lorebookById(bid) }.getOrNull()?.let { bk ->
+                                                newChatLorebookId = bk.id
+                                                newChatLoreName = bk.name
+                                            }
+                                        }
+                                    }
                                     createChatSession(cr.id, newChatTitle.trim())
                                     newChatTitle = ""
                                 }
@@ -2051,6 +2345,18 @@ private fun AttachmentViews(raw: String?) {
 /** 工作助理默认提示词（新建工作任务时预填，用户可改可清空）。 */
 const val DEFAULT_ASSISTANT_PROMPT =
     "你是一名克制的写作助理。保留用户原本的语气，不编造事实。写作前先梳理目标、读者和结构；引用知识库事实时保留来源，并明确标注仍需核实的内容"
+
+/** TTS 文本：优先读引号里的台词；没有台词才退回“去动作”全文。 */
+fun ttsText(raw: String, readActions: Boolean): String {
+    if (readActions) return raw
+    val quoted = Regex("""[“"「『]([^”"」』]{1,300})[”"」』]""")
+        .findAll(raw)
+        .map { it.groupValues[1].trim() }
+        .filter { it.isNotBlank() }
+        .toList()
+    if (quoted.isNotEmpty()) return quoted.joinToString("。")
+    return stripAction(raw)
+}
 
 fun stripAction(raw: String): String {
     var t = raw

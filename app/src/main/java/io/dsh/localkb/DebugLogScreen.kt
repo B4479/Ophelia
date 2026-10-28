@@ -45,6 +45,31 @@ fun DebugLogScreen(db: Db, onBack: () -> Unit) {
                     }
                 },
                 actions = {
+                    val ctx = androidx.compose.ui.platform.LocalContext.current
+                    val debuggable = (ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                    if (debuggable) {
+                        TextButton(onClick = {
+                            scope.launch {
+                                val msg = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        val f = java.io.File(ctx.getExternalFilesDir(null), "card_with_book.json")
+                                        if (!f.isFile) return@runCatching "测试文件不存在"
+                                        val bytes = f.readBytes()
+                                        val card = CardParser.parse(bytes) ?: return@runCatching "卡片解析失败"
+                                        val bookJson = CardParser.extractCharacterBook(bytes)
+                                        val id = db.addCharacter(card, null)
+                                        val n = bookJson?.let {
+                                            LoreImport.importCharacterBook(db, card.name, it)
+                                                ?.let { r -> db.setSetting("char_lore_$id", r.first.toString()); r.second }
+                                        }
+                                        "导入 ${card.name}，世界书 ${n ?: 0} 条"
+                                    }.getOrElse { "失败：${it.message}" }
+                                }
+                                db.log("debug-import", 0, "test", msg)
+                                reload()
+                            }
+                        }) { Text("导入测试卡", fontSize = 12.sp) }
+                    }
                     TextButton(onClick = {
                         scope.launch {
                             withContext(Dispatchers.IO) { db.clearLogs() }
