@@ -56,7 +56,16 @@ class MainActivity : ComponentActivity() {
         // Android 15+ 强制 edge-to-edge：adjustResize 不再生效，必须自己处理 IME insets
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val db = Db(applicationContext)
-        setContent {
+        // 首启引导状态必须在 UI 组合前落库，否则第一帧读不到标志位、弹窗不出现
+        runCatching {
+            val hasApi = !db.getSetting("llm_key").isNullOrBlank() || db.listCloudModels().isNotEmpty()
+            val hasLocal = Catalog.MODELS.any {
+                it.type == Catalog.TYPE_CHAT && Catalog.isInstalled(applicationContext, it)
+            }
+            db.ensureOnboardingState(hasApi || hasLocal)
+        }
+
+    setContent {
             AppColors.AppTheme {
                 Surface(color = AppColors.bg, modifier = Modifier.fillMaxSize()) {
                     AppRoot(db)
@@ -74,13 +83,6 @@ private fun AppRoot(db: Db) {
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             runCatching { db.verifySchema() }
-            runCatching {
-                val hasApi = !db.getSetting("llm_key").isNullOrBlank() || db.listCloudModels().isNotEmpty()
-                val hasLocal = Catalog.MODELS.any {
-                    it.type == Catalog.TYPE_CHAT && Catalog.isInstalled(context, it)
-                }
-                db.ensureOnboardingState(hasApi || hasLocal)
-            }
             runCatching { ImportQueue.resumeAll(context, db) }
         }
     }

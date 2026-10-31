@@ -494,67 +494,82 @@ fun lorebookBlock(
     context: android.content.Context,
     db: Db,
     chatId: Long,
-    lorebookId: Long?,
+    lorebookIds: List<Long>,
     query: String,
 ): String? {
-    val id = lorebookId ?: return null
-    val book = db.lorebookById(id) ?: return null
-    val entries = db.listLoreEntries(id, onlyEnabled = true)
-    if (entries.isEmpty()) return null
+    if (lorebookIds.isEmpty()) return null
+    val books = lorebookIds.mapNotNull { id -> runCatching { db.lorebookById(id) }.getOrNull() }
+    if (books.isEmpty()) return null
 
     val stickyOn = GenParamsStore.stickyEnabled(db)
     val sticky = if (stickyOn) LoreSticky.set(chatId) else emptySet()
-    val always = entries.filter { it.mode == MODE_ALWAYS }
-    // 关键词条目可能配置“扫描最近 N 条”，这里按最大深度一次性取回语料
-    val maxDepth = entries.filter { it.mode == MODE_KEYWORD }
-        .maxOfOrNull { it.scanDepth } ?: 0
-    val recentText = if (maxDepth > 0) {
-        runCatching { db.recentMessagesText(chatId, maxDepth) }.getOrDefault("")
-    } else ""
-    fun corpusFor(e: LoreEntry): String =
-        if (e.scanDepth > 0) recentText + "\n" + query else query
-    fun hitKeys(text: String, raw: String?, caseSensitive: Boolean): Boolean =
-        splitKeys(raw).any { k ->
-            if (caseSensitive) text.contains(k) else text.contains(k, ignoreCase = true)
-        }
+    val hitIds = ArrayList<Long>()
+    val sb = StringBuilder()
+    var remaining = 3000
 
-    // 关键词模式：主关键词命中（selective 时还要命中次级关键词）；本会话命中过之后保持（粘性）
-    val keywordHits = entries.filter { e ->
-        if (e.mode != MODE_KEYWORD) return@filter false
-        if (e.id in sticky) return@filter true
-        val corpus = corpusFor(e)
-        val primary = hitKeys(corpus, e.keys, e.caseSensitive)
-        if (!primary) return@filter false
-        if (e.selective) hitKeys(corpus, e.keys2, e.caseSensitive) else true
-    }
-    // 向量模式：命中过的本会话保持（粘性），否则按相似度 >= 0.60 判定
-    val vectorEntries = entries.filter { it.mode == MODE_VECTOR }
-    val vectorHits = ArrayList<LoreEntry>()
-    if (vectorEntries.isNotEmpty()) {
-        val qv = runCatching { EmbedderHolder.get(context).embed(query) }.getOrNull()
-        if (qv != null) {
-            for (e in vectorEntries) {
-                if (e.id in sticky) { vectorHits.add(e); continue }
-                val ev = e.emb ?: runCatching {
-                    EmbedderHolder.get(context).embed(e.title + " " + e.content)
-                }.getOrNull()
-                if (ev == null) continue
-                if (cosine(qv, ev) >= 0.60f) vectorHits.add(e)
+    for (book in books) {
+        val entries = runCatching { db.listLoreEntries(book.id, onlyEnabled = true) }.getOrDefault(emptyList())
+        if (entries.isEmpty()) continue
+
+        val maxDepth = entries.filter { it.mode == MODE_KEYWORD }.maxOfOrNull { it.scanDepth } ?: 0
+        val recentText = if (maxDepth > 0) {
+            runCatching { db.recentMessagesText(chatId, maxDepth) }.getOrDefault("")
+        } else ""
+        fun corpusFor(e: LoreEntry): String =
+            if (e.scanDepth > 0) recentText + "\n" + query else query
+        fun hitKeys(text: String, raw: String?, caseSensitive: Boolean): Boolean =
+            splitKeys(raw).any { k ->
+                if (caseSensitive) text.contains(k) else text.contains(k, ignoreCase = true)
+            }
+
+        val always = entries.filter { it.mode == MODE_ALWAYS }
+        val keywordHits = entries.filter { e ->
+            if (e.mode != MODE_KEYWORD) return@filter false
+            if (e.id in sticky) return@filter true
+            val corpus = corpusFor(e)
+            val primary = hitKeys(corpus, e.keys, e.caseSensitive)
+            if (!primary) return@filter false
+            if (e.selective) hitKeys(corpus, e.keys2, e.caseSensitive) else true
+        }
+        val vectorEntries = entries.filter { it.mode == MODE_VECTOR }
+        val vectorHits = ArrayList<LoreEntry>()
+        if (vectorEntries.isNotEmpty()) {
+            val qv = runCatching { EmbedderHolder.get(context).embed(query) }.getOrNull()
+            if (qv != null) {
+                for (e in vectorEntries) {
+                    if (e.id in sticky) { vectorHits.add(e); continue }
+                    val ev = e.emb ?: runCatching {
+                        EmbedderHolder.get(context).embed(e.title + " " + e.content)
+                    }.getOrNull()
+                    if (ev == null) continue
+                    if (cosine(qv, ev) >= 0.60f) vectorHits.add(e)
+                }
             }
         }
-    }
-    val hits = keywordHits + vectorHits
-    LoreSticky.hit(chatId, hits.map { it.id })
+        hitIds.addAll(keywordHits.map { it.id })
+        hitIds.addAll(vectorHits.map { it.id })
 
-    val ordered = always + keywordHits + vectorHits
-    if (ordered.isEmpty()) return null
-    val sb = StringBuilder("【世界设定 · ${book.name}】\n")
-    for (e in ordered) {
-        val piece = if (e.title.isBlank()) "- ${e.content}\n" else "- ${e.title}：${e.content}\n"
-        if (sb.length + piece.length > 2000) break
-        sb.append(piece)
+        val ordered = always + keywordHits + vectorHits
+        if (ordered.isEmpty()) continue
+
+        val head = "【世界设定 · ${book.name}】\n"
+        if (remaining <= head.length) break
+        sb.append(head)
+        remaining -= head.length
+        var bookUsed = 0
+        for (e in ordered) {
+            val piece = if (e.title.isBlank()) "- ${e.content}\n" else "- ${e.title}：${e.content}\n"
+            if (bookUsed + piece.length > 2000) break
+            if (remaining - piece.length < 0) break
+            sb.append(piece)
+            bookUsed += piece.length
+            remaining -= piece.length
+        }
+        sb.append("\n")
     }
-    return sb.toString().trim()
+    if (stickyOn) LoreSticky.hit(chatId, hitIds)
+    val out = sb.toString().trim()
+    return if (out.isBlank()) null else out
 }
 
 private fun cosine(a: FloatArray, b: FloatArray): Float {

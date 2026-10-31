@@ -26,8 +26,8 @@ android {
         applicationId = "io.dsh.localkb"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = 4
+        versionName = "0.3.1"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -99,6 +99,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

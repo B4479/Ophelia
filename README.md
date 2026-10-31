@@ -7,6 +7,7 @@
 - **知识库**：PDF / EPUB / DOCX / PPTX / XLSX / TXT / MD / 图片导入，扫描件自动 OCR，后台断点续传
 - **检索**：本地 bge-small 向量 + BM25 混合检索，回答里的 `[1]` 可跳到 PDF 原页
 - **对话**：本地 GGUF（Qwen / GLM / DeepSeek / Gemma）或任意 OpenAI 兼容云端接口，流式输出
+- **模板自适应**：读取 GGUF 自带 `chat_template`（Qwen / GLM / Gemma / Llama3），并清洗残留控制标记
 - **工作任务**：引用多个知识库 + 工作助理模板，产出结构化结果
 - **识图**：本地 Qwen2-VL-2B 或云端视觉模型
 - **语音**：GPT-SoVITS 音色包朗读（可跳过动作描写）、情境声

@@ -18,6 +18,7 @@ struct Session {
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
     int n_ctx = 2048;
+    std::string chat_template;
 };
 
 std::once_flag g_backend_once;
@@ -47,13 +48,47 @@ jstring utf8_to_jstring(JNIEnv * env, const std::string & s) {
     return out;
 }
 
+std::vector<std::string> read_string_array(JNIEnv * env, jobjectArray arr) {
+    std::vector<std::string> out;
+    if (arr == nullptr) return out;
+    const jsize n = env->GetArrayLength(arr);
+    out.reserve((size_t) n);
+    for (jsize i = 0; i < n; ++i) {
+        auto s = (jstring) env->GetObjectArrayElement(arr, i);
+        out.push_back(jstring_to_std(env, s));
+        env->DeleteLocalRef(s);
+    }
+    return out;
+}
+
+// 累计输出里是否以某个标记结尾（标记可能被拆成多个 token）
+bool ends_with_any(const std::string & text, const std::vector<std::string> & markers) {
+    for (const auto & m : markers) {
+        if (!m.empty() && text.size() >= m.size() &&
+            text.compare(text.size() - m.size(), m.size(), m) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const std::vector<std::string> & default_stops() {
+    static const std::vector<std::string> v = {
+            "<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id|>",
+            "<|start_header_id|>", "<|end_header_id|>", "<|end|>",
+            "<start_of_turn>", "<end_of_turn>", "</s>",
+            "[gMASK]", "<sop>", "<|user|>", "<|assistant|>", "<|system|>",
+    };
+    return v;
+}
+
 } // namespace
 
 extern "C" {
 
 JNIEXPORT jstring JNICALL
 Java_io_dsh_localkb_LocalLlm_nativeVersion(JNIEnv * env, jclass) {
-    return env->NewStringUTF("llama.cpp bridge v1");
+    return env->NewStringUTF("llama.cpp bridge v2");
 }
 
 JNIEXPORT jlong JNICALL
@@ -87,7 +122,10 @@ Java_io_dsh_localkb_LocalLlm_nativeLoad(JNIEnv * env, jclass, jstring jpath, jin
         return 0;
     }
     s->vocab = llama_model_get_vocab(s->model);
-    LOGI("model loaded: %s (n_ctx=%d)", path.c_str(), s->n_ctx);
+    const char * tmpl = llama_model_chat_template(s->model, nullptr);
+    if (tmpl != nullptr) s->chat_template = tmpl;
+    LOGI("model loaded: %s (n_ctx=%d, template=%s)", path.c_str(), s->n_ctx,
+         s->chat_template.empty() ? "none" : "builtin");
     return reinterpret_cast<jlong>(s);
 }
 
@@ -100,19 +138,87 @@ Java_io_dsh_localkb_LocalLlm_nativeFree(JNIEnv *, jclass, jlong handle) {
     delete s;
 }
 
+/** 返回模型自带的对话模板（GGUF tokenizer.chat_template），没有则返回空串。 */
+JNIEXPORT jstring JNICALL
+Java_io_dsh_localkb_LocalLlm_nativeChatTemplate(JNIEnv * env, jclass, jlong handle) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    if (s == nullptr) return env->NewStringUTF("");
+    return utf8_to_jstring(env, s->chat_template);
+}
+
+/** 计算一段文本的 token 数；失败返回 -1。 */
+JNIEXPORT jint JNICALL
+Java_io_dsh_localkb_LocalLlm_nativeTokenCount(JNIEnv * env, jclass, jlong handle, jstring jtext) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    if (s == nullptr || s->vocab == nullptr) return -1;
+    const std::string text = jstring_to_std(env, jtext);
+    if (text.empty()) return 0;
+    std::vector<llama_token> tokens(text.size() + 16);
+    int n = llama_tokenize(s->vocab, text.c_str(), (int32_t) text.size(),
+                           tokens.data(), (int32_t) tokens.size(), false, true);
+    if (n < 0) return -n;   // llama 返回所需容量
+    return n;
+}
+
+/**
+ * 用模型自带模板渲染对话。roles/contents 等长，按顺序追加。
+ * 成功返回完整提示词（已包含 assistant 起手标记）；模型无模板或模板不受支持返回空串。
+ */
+JNIEXPORT jstring JNICALL
+Java_io_dsh_localkb_LocalLlm_nativeApplyTemplate(
+        JNIEnv * env, jclass, jlong handle, jobjectArray jroles, jobjectArray jcontents) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    if (s == nullptr || s->model == nullptr) return env->NewStringUTF("");
+
+    const auto roles = read_string_array(env, jroles);
+    const auto contents = read_string_array(env, jcontents);
+    if (roles.empty() || roles.size() != contents.size()) return env->NewStringUTF("");
+
+    std::vector<llama_chat_message> msgs;
+    msgs.reserve(roles.size());
+    for (size_t i = 0; i < roles.size(); ++i) {
+        msgs.push_back({roles[i].c_str(), contents[i].c_str()});
+    }
+
+    const char * tmpl = s->chat_template.empty() ? nullptr : s->chat_template.c_str();
+    std::vector<char> buf(8192);
+    int32_t need = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                             buf.data(), (int32_t) buf.size());
+    if (need < 0) {
+        LOGI("chat template not supported by llama_chat_apply_template");
+        return env->NewStringUTF("");
+    }
+    if (need > (int32_t) buf.size()) {
+        buf.resize((size_t) need + 1);
+        need = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                         buf.data(), (int32_t) buf.size());
+        if (need < 0) return env->NewStringUTF("");
+    }
+    return utf8_to_jstring(env, std::string(buf.data(), (size_t) need));
+}
+
 /**
  * 生成文本。sink 为 Kotlin 回调（可为 null），每产出一个片段调用一次 sink.onToken(String)。
- * 返回完整文本。
+ * stops 为额外停止标记（模型模板相关），命中即截断。
+ * 返回完整文本；提示词超长时返回空串（Kotlin 侧会缩减历史后重试）。
  */
 JNIEXPORT jstring JNICALL
 Java_io_dsh_localkb_LocalLlm_nativeGenerate(
         JNIEnv * env, jclass, jlong handle, jstring jprompt,
-        jint maxTokens, jfloat temp, jfloat topP, jobject sink) {
+        jint maxTokens, jfloat temp, jfloat topP, jobject sink, jobjectArray jstops) {
 
     auto * s = reinterpret_cast<Session *>(handle);
     if (s == nullptr || s->ctx == nullptr) return env->NewStringUTF("");
 
     const std::string prompt = jstring_to_std(env, jprompt);
+
+    // 合并停止标记：调用方传入 + 内置兜底
+    std::vector<std::string> stops = read_string_array(env, jstops);
+    for (const auto & m : default_stops()) {
+        bool dup = false;
+        for (const auto & x : stops) if (x == m) { dup = true; break; }
+        if (!dup) stops.push_back(m);
+    }
 
     // 分词
     std::vector<llama_token> tokens(prompt.size() + 16);
@@ -129,17 +235,20 @@ Java_io_dsh_localkb_LocalLlm_nativeGenerate(
     }
     tokens.resize(n);
 
-    // 截断，给生成留空间
-    const int budget = s->n_ctx - (maxTokens > 0 ? maxTokens : 256) - 8;
+    // 不再从头部硬截断（会切坏对话模板，模型会把模板标记当正文续写）。
+    // 超长直接返回空串，由 Kotlin 缩减历史后重试。
+    const int limit = maxTokens > 0 ? maxTokens : 256;
+    const int budget = s->n_ctx - limit - 8;
     if (budget > 0 && n > budget) {
-        tokens.erase(tokens.begin(), tokens.begin() + (n - budget));
-        n = (int) tokens.size();
+        LOGE("prompt too long: %d tokens > budget %d (n_ctx=%d), ask Kotlin to shrink",
+             n, budget, s->n_ctx);
+        return env->NewStringUTF("");
     }
 
     // 清空 KV，重新开始
     llama_memory_clear(llama_get_memory(s->ctx), true);
 
-    // 关键：prompt 可能几千 token，必须按 n_batch 分批 decode，
+    // prompt 可能几千 token，必须按 n_batch 分批 decode，
     // 一次性提交超过 n_batch 会在 llama_context::decode 里 ggml_abort（闪退）
     const int n_batch = 512;
     for (int off = 0; off < n; off += n_batch) {
@@ -167,8 +276,8 @@ Java_io_dsh_localkb_LocalLlm_nativeGenerate(
     }
 
     std::string out;
-    const int limit = maxTokens > 0 ? maxTokens : 256;
-    for (int i = 0; i < limit; ++i) {
+    bool stopped = false;
+    for (int i = 0; i < limit && !stopped; ++i) {
         llama_token id = llama_sampler_sample(smpl, s->ctx, -1);
         if (llama_vocab_is_eog(s->vocab, id)) break;
 
@@ -176,13 +285,14 @@ Java_io_dsh_localkb_LocalLlm_nativeGenerate(
         int len = llama_token_to_piece(s->vocab, id, buf, sizeof(buf), 0, true);
         if (len > 0) {
             std::string piece(buf, len);
-            // 有些 GGUF（如 Qwen）没有把 <|im_end|> 标成 EOG，这里手动截断
-            bool stop = false;
-            for (const char * marker : {"<|im_end|>", "<|endoftext|>", "</s>"}) {
-                auto pos = piece.find(marker);
+
+            // 片段内命中停止标记 → 截断
+            for (const auto & m : stops) {
+                if (m.empty()) continue;
+                auto pos = piece.find(m);
                 if (pos != std::string::npos) {
                     piece = piece.substr(0, pos);
-                    stop = true;
+                    stopped = true;
                     break;
                 }
             }
@@ -195,11 +305,19 @@ Java_io_dsh_localkb_LocalLlm_nativeGenerate(
                     if (cont == JNI_FALSE) break;   // Kotlin 侧要求停止
                 }
             }
-            if (stop) break;
-            // 结束标记可能被拆成多个 token，检查累计输出的结尾
-            if (out.size() >= 10 && out.compare(out.size() - 10, 10, "<|im_end|>") == 0) break;
-            if (out.size() >= 13 && out.compare(out.size() - 13, 13, "<|endoftext|>") == 0) break;
-            if (out.size() >= 4 && out.compare(out.size() - 4, 4, "</s>") == 0) break;
+            if (stopped) break;
+            // 标记可能被拆成多个 token：检查累计输出结尾
+            if (ends_with_any(out, stops)) {
+                // 去掉已写出的标记尾部（一般上一步已在片段内截断，这里兜底）
+                for (const auto & m : stops) {
+                    if (!m.empty() && out.size() >= m.size() &&
+                        out.compare(out.size() - m.size(), m.size(), m) == 0) {
+                        out.erase(out.size() - m.size());
+                        break;
+                    }
+                }
+                break;
+            }
         }
 
         llama_batch one = llama_batch_get_one(&id, 1);
@@ -210,10 +328,16 @@ Java_io_dsh_localkb_LocalLlm_nativeGenerate(
     }
 
     llama_sampler_free(smpl);
-    for (const char * marker : {"<|im_end|>", "<|endoftext|>", "</s>"}) {
-        auto pos = out.find(marker);
-        if (pos != std::string::npos) out = out.substr(0, pos);
+
+    // 兜底：从最早出现的标记处截断
+    size_t cut = std::string::npos;
+    for (const auto & m : stops) {
+        if (m.empty()) continue;
+        auto pos = out.find(m);
+        if (pos != std::string::npos && (cut == std::string::npos || pos < cut)) cut = pos;
     }
+    if (cut != std::string::npos) out = out.substr(0, cut);
+
     return utf8_to_jstring(env, out);
 }
 

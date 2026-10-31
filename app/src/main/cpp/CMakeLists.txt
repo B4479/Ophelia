@@ -38,3 +38,7 @@ target_include_directories(llama_bridge PRIVATE
         llama.cpp/ggml/include
         llama.cpp/tools/mtmd)
 target_link_libraries(llama_bridge PRIVATE mtmd llama ${log-lib} android)
+# Android 15+/16KB 页：让 LOAD 段按 16KB 对齐
+target_link_options(llama_bridge PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")

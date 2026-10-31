@@ -6,7 +6,11 @@ import java.io.File
 
 /**
  * 端侧对话模型（llama.cpp + GGUF）。
- * 首次使用会加载模型（1–3 秒），之后常驻内存。
+ *
+ * 提示词优先使用 GGUF 自带的对话模板（`tokenizer.chat_template`），
+ * 由 native 调 `llama_chat_apply_template` 渲染；模型没有模板时才回退 ChatML。
+ * 这样 Qwen / GLM / Gemma / Llama3 等不同家族都能正常对话，不会把
+ * `<|im_start|>` 之类的控制标记当正文吐出来。
  */
 object LocalLlm {
 
@@ -22,13 +26,22 @@ object LocalLlm {
     private external fun nativeVersion(): String
     private external fun nativeLoad(path: String, nThreads: Int, nCtx: Int): Long
     private external fun nativeFree(handle: Long)
+    private external fun nativeChatTemplate(handle: Long): String
+    private external fun nativeTokenCount(handle: Long, text: String): Int
+    private external fun nativeApplyTemplate(
+        handle: Long,
+        roles: Array<String>,
+        contents: Array<String>,
+    ): String
+
     private external fun nativeGenerate(
         handle: Long,
         prompt: String,
         maxTokens: Int,
         temp: Float,
         topP: Float,
-        sink: TokenSink?
+        sink: TokenSink?,
+        stops: Array<String>,
     ): String
 
     @Volatile
@@ -37,11 +50,25 @@ object LocalLlm {
     @Volatile
     private var loadedPath: String? = null
 
+    @Volatile
+    private var chatTemplate: String = ""
+
+    /** 模板里提取出的控制标记，作为停止序列传给 native。 */
+    @Volatile
+    private var templateStops: Array<String> = emptyArray()
+
     val version: String by lazy { runCatching { nativeVersion() }.getOrDefault("unavailable") }
 
     fun isReady(): Boolean = handle != 0L
 
     fun loadedModelPath(): String? = loadedPath
+
+    /** 当前模型的对话模板描述，用于设置页展示。 */
+    fun templateInfo(): String = when {
+        !isReady() -> "未加载"
+        chatTemplate.isNotBlank() -> "模型自带模板"
+        else -> "内置 ChatML"
+    }
 
     @Synchronized
     fun load(modelPath: String, threads: Int = 4, nCtx: Int = 4096): Boolean {
@@ -52,7 +79,14 @@ object LocalLlm {
         if (h == 0L) return false
         handle = h
         loadedPath = modelPath
-        Log.i("LocalLlm", "loaded in ${System.currentTimeMillis() - t0}ms: $modelPath")
+        chatTemplate = runCatching { nativeChatTemplate(h) }.getOrDefault("")
+        templateStops = deriveStops(chatTemplate)
+        Log.i(
+            "LocalLlm",
+            "loaded in ${System.currentTimeMillis() - t0}ms: $modelPath | template=" +
+                (if (chatTemplate.isBlank()) "none(chatml)" else "builtin") +
+                " | stops=${templateStops.size}"
+        )
         return true
     }
 
@@ -62,11 +96,43 @@ object LocalLlm {
             runCatching { nativeFree(handle) }
             handle = 0L
             loadedPath = null
+            chatTemplate = ""
+            templateStops = emptyArray()
         }
     }
 
     private const val N_CTX = 4096
     private const val SAFETY = 220
+
+    /** 兜底停止标记（native 侧还有一份，双保险）。 */
+    private val FALLBACK_STOPS = arrayOf(
+        "<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id|>",
+        "<start_of_turn>", "<end_of_turn>", "</s>", "[gMASK]", "<sop>",
+        "<|user|>", "<|assistant|>", "<|system|>",
+    )
+
+    /** 从模板文本里抠出 `<|xxx|>` / `<xxx>` / `[gMASK]` 形式的标记。 */
+    private fun deriveStops(template: String): Array<String> {
+        if (template.isBlank()) return FALLBACK_STOPS
+        val found = LinkedHashSet<String>()
+        Regex("<\\|[^|<>\\s]{1,32}\\|>").findAll(template).forEach { found.add(it.value) }
+        Regex("</?[a-zA-Z_]{2,32}>").findAll(template).forEach { found.add(it.value) }
+        Regex("\\[[a-zA-Z]{2,16}\\]").findAll(template).forEach { found.add(it.value) }
+        // 只保留“结束”或“开头”类标记会太保守，模板里出现的都当停止标记更安全
+        found.addAll(FALLBACK_STOPS)
+        return found.toTypedArray()
+    }
+
+    /** 去掉正文里残留的模板标记（模型偶尔会吐）。 */
+    private fun sanitize(text: String): String {
+        var s = text
+        for (m in templateStops) {
+            if (m.isBlank()) continue
+            val idx = s.indexOf(m)
+            if (idx >= 0) s = s.substring(0, idx)
+        }
+        return s.trim()
+    }
 
     /** 保守估算 token：CJK 约 1 字 1 token，ASCII 约 4 字符 1 token。 */
     fun estimateTokens(text: String): Int {
@@ -84,61 +150,70 @@ object LocalLlm {
         return tokens.toInt() + 1
     }
 
+    /** ChatML 兜底（模型没有自带模板时用）。 */
+    private fun chatMl(messages: List<Pair<String, String>>): String {
+        val sb = StringBuilder()
+        for ((role, content) in messages) {
+            sb.append("<|im_start|>").append(role).append('\n')
+                .append(content).append("<|im_end|>\n")
+        }
+        sb.append("<|im_start|>assistant\n")
+        return sb.toString()
+    }
+
+    private fun render(messages: List<Pair<String, String>>): String {
+        if (chatTemplate.isNotBlank()) {
+            val roles = messages.map { it.first }.toTypedArray()
+            val contents = messages.map { it.second }.toTypedArray()
+            val out = runCatching { nativeApplyTemplate(handle, roles, contents) }.getOrDefault("")
+            if (out.isNotBlank()) return out
+            Log.w("LocalLlm", "applyTemplate failed, fallback to ChatML")
+        }
+        return chatMl(messages)
+    }
+
     /**
-     * 在 n_ctx 内组装 ChatML：优先保留当前问题，其次系统提示，最后按从新到旧追加历史。
-     * 超出预算时对问题/系统提示做尾部截断，并在日志里记录被丢弃的历史条数。
+     * 在 n_ctx 内组装提示词：优先当前问题，再系统提示，最后按新→旧追加历史。
+     * 超预算时整轮丢弃历史（绝不切断对话结构），仍超长才截断问题本身。
      */
-    private fun chatMl(
+    private fun buildPrompt(
         system: String,
         history: List<Pair<String, String>>,
         user: String,
         maxTokens: Int,
     ): String {
         val budget = N_CTX - maxTokens - SAFETY
-        var sys = system
         var question = user
-        var used = 0
+        var kept = history.takeLast(12)
 
-        if (estimateTokens(question) > budget / 2) {
-            // 问题本身过大（例如超长附件）：按字符截断到约一半预算
-            val keepChars = (budget / 2).coerceAtLeast(200)
-            question = question.take(keepChars) + "\n…（内容过长已截断）"
-        }
-        used += estimateTokens(question)
-
-        if (sys.isNotBlank()) {
-            val sysBudget = (budget - used).coerceAtLeast(120)
-            if (estimateTokens(sys) > sysBudget) {
-                sys = sys.take((sysBudget * 0.9).toInt().coerceAtLeast(100)) + "…"
-            }
-            used += estimateTokens(sys)
+        fun assemble(q: String): List<Pair<String, String>> {
+            val msgs = ArrayList<Pair<String, String>>()
+            if (system.isNotBlank()) msgs.add("system" to system)
+            msgs.addAll(kept)
+            msgs.add("user" to q)
+            return msgs
         }
 
-        val kept = ArrayList<Pair<String, String>>()
-        var dropped = 0
-        for (m in history.takeLast(12).asReversed()) {
-            val cost = estimateTokens(m.second) + 8
-            if (used + cost > budget) {
-                dropped++
-                continue
-            }
-            kept.add(0, m)
-            used += cost
-        }
-        if (dropped > 0) {
-            Log.i("LocalLlm", "prompt trimmed: dropped $dropped history msgs, est=$used/${budget}")
+        // 1) 整轮丢弃历史，直到装得下
+        while (true) {
+            val promptLen = runCatching { nativeTokenCount(handle, render(assemble(question))) }
+                .getOrDefault(-1)
+            if (promptLen in 0..budget) return render(assemble(question))
+            val promptLenByEstimate = estimateTokens(render(assemble(question)))
+            if (promptLen < 0 && promptLenByEstimate <= budget) return render(assemble(question))
+            if (kept.isEmpty()) break
+            kept = kept.drop(1)
+            Log.i("LocalLlm", "prompt over budget ($promptLen), dropped oldest history, left=${kept.size}")
         }
 
-        val sb = StringBuilder()
-        if (sys.isNotBlank()) {
-            sb.append("<|im_start|>system\n").append(sys).append("<|im_end|>\n")
+        // 2) 历史清空仍超长 → 截断问题
+        var guard = 0
+        while (estimateTokens(render(assemble(question))) > budget && guard < 6) {
+            val keep = (question.length * 3 / 4).coerceAtLeast(200)
+            question = question.take(keep) + "\n…（内容过长已截断）"
+            guard++
         }
-        for ((role, content) in kept) {
-            sb.append("<|im_start|>").append(role).append('\n').append(content).append("<|im_end|>\n")
-        }
-        sb.append("<|im_start|>user\n").append(question).append("<|im_end|>\n")
-        sb.append("<|im_start|>assistant\n")
-        return sb.toString()
+        return render(assemble(question))
     }
 
     /**
@@ -162,16 +237,32 @@ object LocalLlm {
                 return Result.failure(IllegalStateException("本地模型加载失败"))
             }
         }
-        val prompt = chatMl(system, history, user, maxTokens)
+        val prompt = buildPrompt(system, history, user, maxTokens)
         val sink = onToken?.let { cb ->
             object : TokenSink {
                 override fun onToken(text: String): Boolean = cb(text)
             }
         }
         val t0 = System.currentTimeMillis()
-        val out = nativeGenerate(handle, prompt, maxTokens, temperature, 0.9f, sink)
+        val out = runCatching {
+            nativeGenerate(handle, prompt, maxTokens, temperature, 0.9f, sink, templateStops)
+        }.getOrDefault("")
+
+        // native 返回空：可能是提示词超长（已被拒绝）或解码失败，缩减历史重试一次
+        if (out.isBlank()) {
+            Log.w("LocalLlm", "empty output, retrying with half history")
+            val retryPrompt = buildPrompt(system, history.dropLast(history.size / 2 + 1), user, maxTokens)
+            val second = runCatching {
+                nativeGenerate(handle, retryPrompt, maxTokens, temperature, 0.9f, sink, templateStops)
+            }.getOrDefault("")
+            val elapsed = System.currentTimeMillis() - t0
+            Log.i("LocalLlm", "retry generated ${second.length} chars in ${elapsed}ms")
+            return Result.success(sanitize(second))
+        }
+
+        val clean = sanitize(out)
         val elapsed = System.currentTimeMillis() - t0
-        Log.i("LocalLlm", "generated ${out.length} chars in ${elapsed}ms")
-        return Result.success(out.trim())
+        Log.i("LocalLlm", "generated ${clean.length} chars in ${elapsed}ms")
+        return Result.success(clean)
     }
 }

@@ -168,7 +168,7 @@ const val MODE_ALWAYS = "always"
 const val MODE_KEYWORD = "keyword"
 const val MODE_VECTOR = "vector"
 
-class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
+class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 19) {
 
     /** 首次安装引导：已有任一配置（云端 API / 本地对话模型）就直接标记完成。 */
     fun ensureOnboardingState(hasModel: Boolean) {
@@ -230,6 +230,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_summary_chat ON chat_summary(chat_id)")
         db.execSQL("CREATE TABLE IF NOT EXISTS turn_memory(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, text TEXT NOT NULL, emb BLOB NOT NULL, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_memory_chat ON turn_memory(chat_id)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS chat_lore(chat_id INTEGER NOT NULL, book_id INTEGER NOT NULL, PRIMARY KEY(chat_id, book_id))")
         db.execSQL("CREATE TABLE model_source(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, builtin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX idx_chunk_kb ON chunk(kb_id)")
         createLoreTables(db)
@@ -282,6 +283,12 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
         if (oldVersion < 2) createCharacterTable(db)
         if (oldVersion < 3) createChatTables(db)
         val migrationErrors = ArrayList<String>()
+        if (oldVersion < 19) {
+            runCatching {
+                db.execSQL("CREATE TABLE IF NOT EXISTS chat_lore(chat_id INTEGER NOT NULL, book_id INTEGER NOT NULL, PRIMARY KEY(chat_id, book_id))")
+                db.execSQL("INSERT OR IGNORE INTO chat_lore(chat_id, book_id) SELECT id, lorebook_id FROM chat WHERE lorebook_id IS NOT NULL")
+            }.onFailure { android.util.Log.e("DbMigration", "chat_lore: $it") }
+        }
         if (oldVersion < 18) {
             listOf(
                 "ALTER TABLE lore_entry ADD COLUMN keys2 TEXT",
@@ -458,6 +465,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
         voiceId: String? = null,
         assistantAvatar: String? = null,
         lorebookId: Long? = null,
+        lorebookIds: List<Long> = emptyList(),
     ): Long {
         val now = System.currentTimeMillis()
         val cv = ContentValues().apply {
@@ -473,9 +481,16 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
             put("assistant_prompt", assistantPrompt)
             put("voice_id", voiceId)
             put("assistant_avatar", assistantAvatar)
-            put("lorebook_id", lorebookId)
+            put("lorebook_id", lorebookIds.firstOrNull() ?: lorebookId)
         }
-        return writableDatabase.insert("chat", null, cv)
+        val newId = writableDatabase.insert("chat", null, cv)
+        val ids = if (lorebookIds.isNotEmpty()) lorebookIds else listOfNotNull(lorebookId)
+        ids.forEach { bid ->
+            runCatching {
+                writableDatabase.execSQL("INSERT OR IGNORE INTO chat_lore(chat_id, book_id) VALUES($newId, $bid)")
+            }
+        }
+        return newId
     }
 
     fun updateChatAssistant(id: Long, name: String?, note: String?, prompt: String?, avatar: String? = null) {
@@ -636,6 +651,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
         writableDatabase.beginTransaction()
         try {
             writableDatabase.delete("lore_entry", "book_id=?", arrayOf(id.toString()))
+            runCatching { writableDatabase.delete("chat_lore", "book_id=?", arrayOf(id.toString())) }
             writableDatabase.delete("lorebook", "id=?", arrayOf(id.toString()))
             val cv = ContentValues().apply { putNull("lorebook_id") }
             writableDatabase.update("chat", cv, "lorebook_id=?", arrayOf(id.toString()))
@@ -735,7 +751,41 @@ class Db(context: Context) : SQLiteOpenHelper(context, "localkb.db", null, 18) {
         writableDatabase.delete("lore_entry", "id=?", arrayOf(id.toString()))
     }
 
+    fun chatLoreIds(chatId: Long): List<Long> {
+        val ids = ArrayList<Long>()
+        readableDatabase.rawQuery(
+            "SELECT book_id FROM chat_lore WHERE chat_id=? ORDER BY book_id", arrayOf(chatId.toString())
+        ).use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
+        if (ids.isEmpty()) {
+            readableDatabase.rawQuery(
+                "SELECT lorebook_id FROM chat WHERE id=? AND lorebook_id IS NOT NULL", arrayOf(chatId.toString())
+            ).use { c -> if (c.moveToNext()) ids.add(c.getLong(0)) }
+        }
+        return ids
+    }
+
+    fun setChatLorebooks(chatId: Long, ids: List<Long>) {
+        writableDatabase.beginTransaction()
+        try {
+            writableDatabase.delete("chat_lore", "chat_id=?", arrayOf(chatId.toString()))
+            ids.forEach { bid ->
+                writableDatabase.execSQL("INSERT OR IGNORE INTO chat_lore(chat_id, book_id) VALUES($chatId, $bid)")
+            }
+            val cv = ContentValues().apply { put("lorebook_id", ids.firstOrNull()) }
+            writableDatabase.update("chat", cv, "id=?", arrayOf(chatId.toString()))
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
     fun setChatLorebook(chatId: Long, lorebookId: Long?) {
+        runCatching {
+            writableDatabase.delete("chat_lore", "chat_id=?", arrayOf(chatId.toString()))
+            if (lorebookId != null) {
+                writableDatabase.execSQL("INSERT OR IGNORE INTO chat_lore(chat_id, book_id) VALUES($chatId, $lorebookId)")
+            }
+        }
         val cv = ContentValues().apply { put("lorebook_id", lorebookId) }
         writableDatabase.update("chat", cv, "id=?", arrayOf(chatId.toString()))
     }
