@@ -20,6 +20,12 @@
 
 需要 JDK 17、Android SDK 35、NDK 26.3、Gradle 8.7。
 
+打包后建议再做一次 16 KB 对齐（签名会失效，需重签）：
+
+```bash
+python tools/align16k.py --in app-release.apk --out aligned.apk   --keystore <ks.jks> --alias <alias> --storepass <pwd>
+```
+
 ```bash
 git clone https://github.com/B4479/Ophelia && cd Ophelia
 git clone https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp   # 体积原因不入库
