@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -551,18 +552,6 @@ private fun KbScreen(db: Db, kb: Kb, tts: TtsPlayer, amb: AmbienceEngine, onBack
                 ) { Icon(Icons.Filled.Search, "搜索", tint = Accent) }
             }
 
-            if (docs.isNotEmpty() && hits.isEmpty() && answer == null) {
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("资本", "国家", "工人", "危机").forEach { sample ->
-                        AssistChip(
-                            onClick = { query = sample },
-                            label = { Text(sample, fontSize = 12.sp) }
-                        )
-                    }
-                }
-            }
-
             val p = progress
             if (p != null) {
                 Spacer(Modifier.height(8.dp))
@@ -655,6 +644,16 @@ private fun KbScreen(db: Db, kb: Kb, tts: TtsPlayer, amb: AmbienceEngine, onBack
                                             color = if (d.status == "ready") Muted else AppColors.warn,
                                             fontSize = 11.sp
                                         )
+                                    }
+                                    if (d.status == "failed" && d.srcPath != null) {
+                                        IconButton(onClick = {
+                                            scope.launch {
+                                                withContext(Dispatchers.IO) { ImportQueue.retry(context, db, d) }
+                                                error = null
+                                                Hybrid.invalidate(kb.id)
+                                                reloadDocs()
+                                            }
+                                        }) { Icon(Icons.Filled.Refresh, "重试导入", tint = Accent) }
                                     }
                                     IconButton(onClick = {
                                         scope.launch {

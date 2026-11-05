@@ -144,6 +144,17 @@ object ImportQueue {
             .enqueueUniqueWork("import_$docId", ExistingWorkPolicy.APPEND_OR_REPLACE, req)
     }
 
+    /** 重试失败的导入：清掉半成品片段，重置进度后重新排队（原件仍在私有目录）。 */
+    fun retry(context: Context, db: Db, doc: DocItem): Boolean {
+        val src = doc.srcPath?.let { File(it) }
+        if (src == null || !src.isFile) return false
+        cancel(context, doc.id)
+        db.deleteChunksFrom(doc.id, 0)
+        db.updateProgress(doc.id, 0, 0, "queued")
+        enqueueWork(context, doc.id)
+        return true
+    }
+
     /** 启动时恢复所有未完成的导入。 */
     fun resumeAll(context: Context, db: Db) {
         val work = WorkManager.getInstance(context)
